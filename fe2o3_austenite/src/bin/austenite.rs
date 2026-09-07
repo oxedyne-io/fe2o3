@@ -18,6 +18,7 @@ use oxedyne_fe2o3_austenite::{
 	book,
 	doc::{
 		self,
+		Heading,
 		Style,
 	},
 	driver::{
@@ -30,6 +31,11 @@ use oxedyne_fe2o3_austenite::{
 	},
 	font::FontMetrics,
 	ir::DrawOp,
+	ledger::{
+		AnchorId,
+		AnchorKind,
+		Ledger,
+	},
 	lang,
 	page::{
 		Frame,
@@ -45,7 +51,10 @@ use oxedyne_fe2o3_font::{
 	face::Role,
 	shape::Dir,
 };
-use oxedyne_fe2o3_graphics::pdf::PdfPage;
+use oxedyne_fe2o3_graphics::pdf::{
+	OutlineItem,
+	PdfPage,
+};
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -138,6 +147,41 @@ fn terse_skip_line(skips: &lang::SkipSummary) -> Option<String> {
 		.map(|(n, c)| fmt!("{} ×{}", n, c))
 		.collect();
 	Some(fmt!("skipped: {}", parts.join(", ")))
+}
+
+/// Builds the PDF document outline (the viewer's bookmark side panel) from the resolved ledger: the
+/// three front-matter leaves first -- title page, meta (imprint) page and contents -- then every body
+/// heading in reading order. The front-matter pages carry no heading of their own, so the block layer
+/// records a `Label` anchor at the top of each (`frontmatter:title`, `frontmatter:meta`,
+/// `frontmatter:contents`); this reads their page back from the ledger. A leaf the book omits sets no
+/// anchor, so its entry is simply absent. Body headings resolve their page through the heading anchor,
+/// and their depth matches the contents list -- a chapter or a part at the top, deeper headings nested
+/// under it. Pages are zero-based, as [`OutlineItem`] wants; the ledger stores them one-based.
+fn build_outline(heads: &[Heading], ledger: &Ledger) -> Vec<OutlineItem> {
+	let mut items: Vec<OutlineItem> = Vec::new();
+
+	// The front matter, at the top and at depth zero, so it stands as a sibling of the first body level.
+	let front = [
+		("frontmatter:title",		"Title"),
+		("frontmatter:meta",		"Meta"),
+		("frontmatter:contents",	"Contents"),
+	];
+	for (key, label) in front {
+		let id = AnchorId::new(AnchorKind::Label, key);
+		if let Some(page) = ledger.page_of(&id) {
+			items.push(OutlineItem { title: label.to_string(), page: (page - 1) as usize, level: 0 });
+		}
+	}
+
+	// Every body heading, its depth the contents indent: a chapter or a part at depth zero, a `==`
+	// section at one, and so on. A heading the ledger has not fixed is skipped rather than guessed.
+	for h in heads {
+		if let Some(page) = ledger.page_of(&h.id) {
+			let level = (h.level.max(1) - 1) as u8;
+			items.push(OutlineItem { title: h.title.clone(), page: (page - 1) as usize, level });
+		}
+	}
+	items
 }
 
 /// Compiles the Typst root at `source` into `out_dir`, writing every page's SVG, the resolved ledger,
@@ -245,7 +289,9 @@ fn compile(source: &str, out_dir: &str) -> Outcome<CompileStats> {
 	let mut t_render_ms	= 0.0f64;	// wall spent in the parallel render stage
 	let mut t_write_ms	= 0.0f64;	// wall spent writing results out in order
 	let pdf_file	= res!(File::create(fmt!("{}/document.pdf", out_dir)));
-	let mut pdf		= res!(emit::pdf::open_document(BufWriter::new(pdf_file), out.pages.len()));
+	let outline		= build_outline(&heads, &out.ledger);
+	let mut pdf		= res!(emit::pdf::open_document_with_outline(
+		BufWriter::new(pdf_file), out.pages.len(), outline));
 
 	// Emit is by far the costliest phase and is embarrassingly parallel: each page's outline transforms
 	// and serialisation are a pure function of its frame, independent of every other page. But a rendered

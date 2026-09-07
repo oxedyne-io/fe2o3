@@ -31,6 +31,7 @@ use oxedyne_fe2o3_graphics::{
 		Path,
 	},
 	pdf::{
+		OutlineItem,
 		PdfPage,
 		PdfStream,
 		PdfWriter,
@@ -58,6 +59,19 @@ pub fn render_document(pages: &[Page]) -> Outcome<Vec<u8>> {
 /// [`render_document`] leaves it, so the two produce identical bytes.
 pub fn open_document<W: Write>(out: W, total: usize) -> Outcome<PdfStream<W>> {
 	PdfStream::new(out, total, false)
+}
+
+/// As [`open_document`], but the file also carries a document outline (the viewer's bookmark side
+/// panel), built by the caller from the heading table and the front-matter anchors. An empty outline
+/// yields a file byte-identical to [`open_document`]'s.
+pub fn open_document_with_outline<W: Write>(
+	out:		W,
+	total:		usize,
+	outline:	Vec<OutlineItem>,
+)
+	-> Outcome<PdfStream<W>>
+{
+	PdfStream::new_with_outline(out, total, false, outline)
 }
 
 /// Renders one page's frame to the open PDF stream. The page's outlines live only for this call: the

@@ -1999,6 +1999,9 @@ fn front_matter(
 
 	// A documentation tree draws the template's two-column title page (a coloured sidebar with its logos and
 	// the title on the right); a book draws its plain centred title page. The sidebar grey marks the idiom.
+	// A `Label` anchor at the leaf's top records its page for the PDF outline; it sets no heading, so it
+	// stays out of the running heads and the contents.
+	nodes.push(Node::Anchor(AnchorId::new(AnchorKind::Label, "frontmatter:title")));
 	if fm.sidebar_grey.is_some() {
 		res!(fm_doc_title_page(nodes, fonts, geom, fm));
 	} else {
@@ -2007,6 +2010,7 @@ fn front_matter(
 	nodes.push(Node::Penalty(Penalty::eject()));
 
 	if fm_has_imprint(fm) {
+		nodes.push(Node::Anchor(AnchorId::new(AnchorKind::Label, "frontmatter:meta")));
 		res!(fm_meta_page(nodes, fonts, geom, style, fm));
 		nodes.push(Node::Penalty(Penalty::eject()));
 	}
@@ -2482,6 +2486,10 @@ pub fn contents(
 {
 	let measure			= geom.content_width();
 	let mut nodes:	Vec<Node> = Vec::new();
+
+	// A `Label` anchor at the top of the contents leaf records its page for the PDF outline. It sets no
+	// heading, so the contents is neither a running-head section nor an entry in its own list.
+	nodes.push(Node::Anchor(AnchorId::new(AnchorKind::Label, "frontmatter:contents")));
 
 	// The block's own heading, in the display face at the back-matter title size, recorded as no anchor --
 	// so it is neither a running-head section nor an entry in its own list.

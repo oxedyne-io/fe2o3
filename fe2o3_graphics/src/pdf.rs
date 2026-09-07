@@ -148,11 +148,111 @@ impl PdfPage {
 	}
 }
 
+/// One entry in the document outline (the viewer's bookmark side panel): a title, the zero-based page
+/// it jumps to, and its nesting depth. Depth zero is a top-level entry; a deeper entry nests under the
+/// nearest preceding entry of a shallower depth, so a flat list in reading order builds the tree. The
+/// destination is the top of the page fitted to the window, which every entry shares -- the outline
+/// names pages, not positions within them.
+#[derive(Clone, Debug)]
+pub struct OutlineItem {
+	pub title:	String,
+	pub page:	usize,	// zero-based page index the entry jumps to
+	pub level:	u8,		// nesting depth, zero at the top
+}
+
+/// The parent, sibling and child links one outline item needs, resolved from the flat level list.
+/// Indices are into the item slice; `count` is the number of descendants, always shown open.
+struct OutlineLinks {
+	parent:	Option<usize>,
+	prev:	Option<usize>,
+	next:	Option<usize>,
+	first:	Option<usize>,
+	last:	Option<usize>,
+	count:	usize,
+}
+
+/// Resolves the flat, reading-order outline list into a tree: each item's parent, siblings and
+/// children, and the roots. A stack of open ancestors gives the nearest shallower item as parent, so
+/// a level that skips a depth still nests sensibly.
+fn build_outline_links(items: &[OutlineItem]) -> (Vec<OutlineLinks>, Vec<usize>) {
+	let n = items.len();
+	let mut children:	Vec<Vec<usize>>	= vec![Vec::new(); n];
+	let mut parent:		Vec<Option<usize>> = vec![None; n];
+	let mut roots:		Vec<usize>		= Vec::new();
+	let mut stack:		Vec<usize>		= Vec::new();
+	for i in 0..n {
+		while let Some(&t) = stack.last() {
+			if items[t].level >= items[i].level {
+				stack.pop();
+			} else {
+				break;
+			}
+		}
+		match stack.last() {
+			Some(&p) => {
+				parent[i] = Some(p);
+				children[p].push(i);
+			},
+			None => roots.push(i),
+		}
+		stack.push(i);
+	}
+
+	// The descendant count of a pre-order list is the run of following items whose level stays deeper.
+	let mut links = Vec::with_capacity(n);
+	for i in 0..n {
+		let siblings = match parent[i] {
+			Some(p)	=> &children[p],
+			None	=> &roots,
+		};
+		let at		= siblings.iter().position(|&j| j == i).unwrap_or(0);
+		let prev	= if at > 0 { Some(siblings[at - 1]) } else { None };
+		let next	= siblings.get(at + 1).copied();
+		let first	= children[i].first().copied();
+		let last	= children[i].last().copied();
+		let mut count = 0usize;
+		let mut j = i + 1;
+		while j < n && items[j].level > items[i].level {
+			count += 1;
+			j += 1;
+		}
+		links.push(OutlineLinks { parent: parent[i], prev, next, first, last, count });
+	}
+	(links, roots)
+}
+
+/// A PDF text string for a title: a parenthesised literal with `(`, `)` and `\` escaped when the text
+/// is printable ASCII, else a UTF-16BE hex string with a byte-order mark so any Unicode renders. Both
+/// forms are deterministic, which the content-addressed file needs.
+fn pdf_text_string(s: &str) -> String {
+	if s.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+		let mut out = String::from("(");
+		for c in s.chars() {
+			match c {
+				'('		=> out.push_str("\\("),
+				')'		=> out.push_str("\\)"),
+				'\\'	=> out.push_str("\\\\"),
+				_		=> out.push(c),
+			}
+		}
+		out.push(')');
+		out
+	} else {
+		let mut out = String::from("<FEFF");
+		for u in s.encode_utf16() {
+			out.push_str(&fmt!("{:04X}", u));
+		}
+		out.push('>');
+		out
+	}
+}
+
 /// Accumulates pages and writes them out as one PDF file.
 #[derive(Clone, Debug, Default)]
 pub struct PdfWriter {
 	pages:		Vec<PdfPage>,
 	compress:	bool,
+	outline:	Vec<OutlineItem>,
 }
 
 impl PdfWriter {
@@ -172,13 +272,20 @@ impl PdfWriter {
 		self.pages.push(page);
 	}
 
+	/// Sets the document outline (the viewer's bookmark side panel), replacing any earlier one. An empty
+	/// list leaves the file with no outline, byte for byte as before the feature existed.
+	pub fn set_outline(&mut self, outline: Vec<OutlineItem>) {
+		self.outline = outline;
+	}
+
 	/// Renders the whole document to PDF bytes.
 	///
 	/// A convenience over [`PdfStream`]: it streams the accumulated pages into an in-memory buffer and
 	/// returns it. The bytes are exactly those [`PdfStream`] writes page by page, so a caller that
 	/// cannot hold the whole document keeps the identical file by streaming to a file handle instead.
 	pub fn to_bytes(&self) -> Outcome<Vec<u8>> {
-		let mut stream = res!(PdfStream::new(Vec::new(), self.pages.len(), self.compress));
+		let mut stream = res!(PdfStream::new_with_outline(
+			Vec::new(), self.pages.len(), self.compress, self.outline.clone()));
 		for page in &self.pages {
 			res!(stream.page(page));
 		}
@@ -203,16 +310,41 @@ pub struct PdfStream<W: Write> {
 	offsets:	Vec<usize>,		// one-based object byte offsets; [0] is the free object
 	pos:		usize,			// bytes of body written so far, the next object's offset
 	added:		usize,			// pages handed over so far
-	next_extra:	usize,			// next free object number past the fixed page/content block, for image XObjects
+	next_extra:	usize,			// next free object number past the fixed block and the outline, for image XObjects
 	hash_a:		u64,			// running FNV-1a of the body, first `/ID` half
 	hash_b:		u64,			// running FNV-1a of the body, second half
+	outline:	Vec<OutlineItem>,	// document outline entries, empty for none
+	outline_root:	usize,		// object number of the /Outlines dict, zero when there is no outline
 }
 
 impl<W: Write> PdfStream<W> {
 	/// Opens a stream for a document of exactly `n` pages, writing the header, catalogue and page tree
 	/// at once. `compress` zlib-compresses each content stream, matching [`PdfWriter::with_compression`].
 	pub fn new(out: W, n: usize, compress: bool) -> Outcome<Self> {
-		let obj_count = 2 + 2 * n;
+		Self::new_with_outline(out, n, compress, Vec::new())
+	}
+
+	/// As [`new`](Self::new), but the file also carries a document outline (the viewer's bookmark side
+	/// panel). Each entry's page must be one of the `n` promised, since its destination names that page
+	/// object. An empty outline yields a file byte-identical to [`new`]'s.
+	pub fn new_with_outline(out: W, n: usize, compress: bool, outline: Vec<OutlineItem>) -> Outcome<Self> {
+		for it in &outline {
+			if it.page >= n {
+				return Err(err!(
+					"An outline entry points at page {} (zero-based), but the document has only {} \
+					page(s); its destination could not be named.", it.page, n; Input, Invalid, Range));
+			}
+		}
+		let obj_count		= 2 + 2 * n;
+		let has_outline		= !outline.is_empty();
+		// The outline dict and one object per entry sit directly after the fixed page/content block; any
+		// image XObject is numbered past them. With no outline the numbering is exactly the original.
+		let outline_root	= if has_outline { obj_count + 1 } else { 0 };
+		let next_extra		= if has_outline {
+			outline_root + 1 + outline.len()
+		} else {
+			obj_count + 1
+		};
 		let mut s = Self {
 			out,
 			compress,
@@ -220,9 +352,11 @@ impl<W: Write> PdfStream<W> {
 			offsets:	vec![0; obj_count + 1],
 			pos:		0,
 			added:		0,
-			next_extra:	obj_count + 1,
+			next_extra,
 			hash_a:		FNV_BASIS_A,
 			hash_b:		FNV_BASIS_B,
+			outline,
+			outline_root,
 		};
 
 		res!(s.body(b"%PDF-1.7\n"));
@@ -230,9 +364,17 @@ impl<W: Write> PdfStream<W> {
 		// transit. Four bytes above 127, as the specification suggests.
 		res!(s.body(b"%\xE2\xE3\xCF\xD3\n"));
 
-		// The catalogue.
+		// The catalogue. When the file carries an outline the catalogue names it and asks the viewer to
+		// open the bookmark panel; with none it is byte for byte the original.
 		s.offsets[1] = s.pos;
-		res!(s.body(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"));
+		if has_outline {
+			let cat = fmt!(
+				"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Outlines {} 0 R /PageMode /UseOutlines >>\nendobj\n",
+				outline_root);
+			res!(s.body(cat.as_bytes()));
+		} else {
+			res!(s.body(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"));
+		}
 
 		// The page tree, naming every page object up front, which is why `n` is fixed here.
 		s.offsets[2] = s.pos;
@@ -377,6 +519,57 @@ impl<W: Write> PdfStream<W> {
 		Ok(())
 	}
 
+	/// Writes the document outline: the `/Outlines` dictionary, then one object per entry, each a title,
+	/// its tree links, and a destination fitting the top of the page it names. The tree is built from the
+	/// flat, reading-order entry list by nesting each entry under the nearest preceding shallower one; the
+	/// counts are shown open, so a viewer opens the whole tree. The objects take the numbers reserved at
+	/// construction, directly after the fixed page/content block.
+	fn write_outline(&mut self) -> Outcome<()> {
+		let root		= self.outline_root;
+		let item_base	= root + 1;	// the first entry's object number
+		// Taken out so the entry loop may borrow it while `self` is mutated for each object written.
+		let outline		= std::mem::take(&mut self.outline);
+		let (links, roots) = build_outline_links(&outline);
+
+		// The `/Outlines` dict: its first and last top-level entries, and the total number of entries,
+		// all open.
+		self.set_extra_offset(root);
+		let first_root	= roots.first().map(|&i| item_base + i).unwrap_or(0);
+		let last_root	= roots.last().map(|&i| item_base + i).unwrap_or(0);
+		let head = fmt!(
+			"{} 0 obj\n<< /Type /Outlines /First {} 0 R /Last {} 0 R /Count {} >>\nendobj\n",
+			root, first_root, last_root, outline.len());
+		res!(self.body(head.as_bytes()));
+
+		// One object per entry, in reading order so its reserved number matches its slice index.
+		for (i, item) in outline.iter().enumerate() {
+			let obj		= item_base + i;
+			let link	= &links[i];
+			let parent	= match link.parent {
+				Some(p)	=> item_base + p,
+				None	=> root,
+			};
+			let page_obj = 3 + 2 * item.page;
+
+			let mut dict = fmt!("{} 0 obj\n<< /Title {} /Parent {} 0 R",
+				obj, pdf_text_string(&item.title), parent);
+			if let Some(p) = link.prev {
+				dict.push_str(&fmt!(" /Prev {} 0 R", item_base + p));
+			}
+			if let Some(nx) = link.next {
+				dict.push_str(&fmt!(" /Next {} 0 R", item_base + nx));
+			}
+			if let (Some(f), Some(l)) = (link.first, link.last) {
+				dict.push_str(&fmt!(" /First {} 0 R /Last {} 0 R /Count {}",
+					item_base + f, item_base + l, link.count));
+			}
+			dict.push_str(&fmt!(" /Dest [{} 0 R /Fit] >>\nendobj\n", page_obj));
+			self.set_extra_offset(obj);
+			res!(self.body(dict.as_bytes()));
+		}
+		Ok(())
+	}
+
 	/// Records the byte offset of an extra object -- an image or soft mask numbered past the fixed
 	/// page/content block -- growing the offset table to reach it. The extras are assigned and written in
 	/// increasing number order, so the table grows one slot at a time and stays indexed by object number.
@@ -391,9 +584,15 @@ impl<W: Write> PdfStream<W> {
 	/// The `/ID` is the body hash folded as the body was written, so the file matches
 	/// [`PdfWriter::to_bytes`] to the byte.
 	pub fn finish(mut self) -> Outcome<W> {
-		// The fixed page/content block is `2 + 2n` objects; every image and soft mask took a further
-		// number past it, so the highest object written is one below the next free number. A document with
-		// no images leaves `next_extra` at `2 + 2n + 1`, giving exactly the original count.
+		// The outline objects -- the `/Outlines` dict and one object per entry -- are written after the
+		// pages, on the numbers reserved for them at construction. A document with no outline writes none.
+		if !self.outline.is_empty() {
+			res!(self.write_outline());
+		}
+
+		// The fixed page/content block is `2 + 2n` objects; the outline and every image and soft mask took
+		// further numbers past it, so the highest object written is one below the next free number. A
+		// document with no outline and no image leaves `next_extra` at `2 + 2n + 1`, the original count.
 		let obj_count = self.next_extra - 1;
 
 		// The identifier is derived from the body already written, never from the clock. The two halves
@@ -682,6 +881,89 @@ mod tests {
 			w.to_bytes()
 		};
 		assert_eq!(res!(build()), res!(build()));
+		Ok(())
+	}
+
+	#[test]
+	fn test_the_outline_nests_by_level_04() -> Outcome<()> {
+		// Two top-level entries, the second with a child and a grandchild, then a third top-level entry.
+		let items = vec![
+			OutlineItem { title: "Title".into(),	page: 0, level: 0 },
+			OutlineItem { title: "One".into(),		page: 1, level: 0 },
+			OutlineItem { title: "One.a".into(),	page: 2, level: 1 },
+			OutlineItem { title: "One.a.i".into(),	page: 3, level: 2 },
+			OutlineItem { title: "Two".into(),		page: 4, level: 0 },
+		];
+		let (links, roots) = build_outline_links(&items);
+		assert_eq!(roots, vec![0, 1, 4], "the three top-level entries are the roots");
+		// The first entry has no parent, no previous sibling, and "One" as its next.
+		assert_eq!(links[0].parent, None);
+		assert_eq!(links[0].prev, None);
+		assert_eq!(links[0].next, Some(1));
+		// "One" parents "One.a", and its descendant count includes the grandchild.
+		assert_eq!(links[1].first, Some(2));
+		assert_eq!(links[1].last, Some(2));
+		assert_eq!(links[1].count, 2, "child and grandchild are both descendants");
+		assert_eq!(links[1].next, Some(4), "Two is the next top-level sibling");
+		// "One.a" nests under "One" and parents the grandchild.
+		assert_eq!(links[2].parent, Some(1));
+		assert_eq!(links[2].first, Some(3));
+		assert_eq!(links[3].parent, Some(2));
+		assert_eq!(links[3].count, 0, "the leaf has no descendants");
+		Ok(())
+	}
+
+	#[test]
+	fn test_the_outline_reaches_the_file_and_dest_pages_05() -> Outcome<()> {
+		// A three-page document with a two-entry outline: the catalogue names the outline and the entries
+		// carry destinations to their page objects (3 + 2*page).
+		let mut w = PdfWriter::new();
+		for _ in 0..3 {
+			let mut page = PdfPage::new(50.0, 50.0);
+			page.fill(res!(Path::rect(Bounds::new(1.0, 1.0, 9.0, 9.0))), Rgba::BLACK);
+			w.add_page(page);
+		}
+		w.set_outline(vec![
+			OutlineItem { title: "Title".into(),	page: 0, level: 0 },
+			OutlineItem { title: "Body".into(),		page: 2, level: 0 },
+		]);
+		let bytes = res!(w.to_bytes());
+		let text = String::from_utf8_lossy(&bytes);
+		assert!(text.contains("/Outlines"), "the catalogue names an outline");
+		assert!(text.contains("/Type /Outlines"), "the outline root dict is present");
+		assert!(text.contains("/Title (Title)"), "the first entry's title");
+		assert!(text.contains("/Title (Body)"), "the second entry's title");
+		// Page 0 is object 3, page 2 is object 7.
+		assert!(text.contains("/Dest [3 0 R /Fit]"), "the first entry jumps to page object 3");
+		assert!(text.contains("/Dest [7 0 R /Fit]"), "the second entry jumps to page object 7");
+		Ok(())
+	}
+
+	#[test]
+	fn test_no_outline_leaves_the_catalogue_untouched_06() -> Outcome<()> {
+		// A document with no outline set carries the bare catalogue, byte for byte as before the feature.
+		let mut w = PdfWriter::new();
+		let mut page = PdfPage::new(50.0, 50.0);
+		page.fill(res!(Path::rect(Bounds::new(1.0, 1.0, 9.0, 9.0))), Rgba::BLACK);
+		w.add_page(page);
+		let bytes = res!(w.to_bytes());
+		let text = String::from_utf8_lossy(&bytes);
+		assert!(text.contains("<< /Type /Catalog /Pages 2 0 R >>"), "the bare catalogue");
+		assert!(!text.contains("/Outlines"), "no outline object when none was set");
+		Ok(())
+	}
+
+	#[test]
+	fn test_a_non_ascii_title_encodes_as_utf16_07() -> Outcome<()> {
+		// A title with an em dash cannot be a printable-ASCII literal, so it is a UTF-16BE hex string with
+		// a byte-order mark.
+		let s = pdf_text_string("A — B");
+		assert!(s.starts_with("<FEFF"), "a UTF-16BE hex string, found: {}", s);
+		assert!(s.ends_with('>'), "closed hex string");
+		// A plain title stays a readable literal.
+		assert_eq!(pdf_text_string("Contents"), "(Contents)");
+		// Parentheses and backslashes in a literal are escaped.
+		assert_eq!(pdf_text_string("a (b) \\ c"), "(a \\(b\\) \\\\ c)");
 		Ok(())
 	}
 
