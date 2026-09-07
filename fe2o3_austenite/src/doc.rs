@@ -53,6 +53,9 @@ use crate::math::{
 };
 use crate::table::{
 	self,
+	Align,
+	Cell,
+	Row,
 	Table,
 };
 use crate::page::{
@@ -491,6 +494,26 @@ pub struct FrontMatter {
 	pub bottom_logo:		Option<String>,	// the logo near the sidebar's foot
 	pub bottom_logo_width:	Sp,
 	pub footer_logo:		Option<String>,	// the logo the template seats at the left of the page footer
+	// The documentation template's meta/colophon page (`template.typ`'s `meta-page`): a bordered
+	// Ver/Date/Author(s)/Notes table over an acknowledgement, a copyright line and a toolchain line at the
+	// page foot. `meta_rows` carries the revision rows, newest first; a non-empty list (or a named author)
+	// marks the idiom, so the doc meta page is composed only for a doc tree, never over the book imprint.
+	pub meta_rows:			Vec<MetaRow>,	// the revision rows the version table sets, in source order
+	pub reading_min:		Option<u32>,	// the whole-document reading time in minutes, appended to the last row's notes
+	pub acknowledgement:	Option<String>,	// the acknowledgement paragraph set near the page foot
+}
+
+/// One revision row of the documentation meta/colophon table: its version, date, author(s), notes, and
+/// the AI-declaration mark the row carries beneath its author. A field the row omits is `None`, and its
+/// column is left out of the table when every row omits it (matching the template's `filled` test).
+#[derive(Clone, Debug)]
+pub struct MetaRow {
+	pub version:		Option<String>,
+	pub date:			Option<String>,
+	pub authors:		String,
+	pub notes:			Option<String>,
+	pub ai_mark_path:	Option<String>,	// the declaration mark image, resolved from the row's slug
+	pub ai_mark_words:	Option<String>,	// the mark's caption, the row's own words when it rescopes them
 }
 
 /// Turns an authored block list into the composed document, and the heading table the running heads
@@ -2048,7 +2071,15 @@ fn front_matter(
 	}
 	nodes.push(Node::Penalty(Penalty::eject()));
 
-	if fm_has_imprint(fm) {
+	// The meta page: a doc tree draws the template's Ver/Date/Author(s)/Notes colophon, a book its plain
+	// imprint page. Both push the `frontmatter:meta` anchor so the outline lists a Meta entry at this leaf.
+	if fm.sidebar_grey.is_some() {
+		if fm_has_doc_meta(fm) {
+			nodes.push(Node::Anchor(AnchorId::new(AnchorKind::Label, "frontmatter:meta")));
+			res!(fm_doc_meta_page(nodes, fonts, geom, style, fm));
+			nodes.push(Node::Penalty(Penalty::eject()));
+		}
+	} else if fm_has_imprint(fm) {
 		nodes.push(Node::Anchor(AnchorId::new(AnchorKind::Label, "frontmatter:meta")));
 		res!(fm_meta_page(nodes, fonts, geom, style, fm));
 		nodes.push(Node::Penalty(Penalty::eject()));
@@ -2071,6 +2102,12 @@ fn front_matter(
 fn fm_has_imprint(fm: &FrontMatter) -> bool {
 	fm.publisher.is_some() || fm.edition.is_some() || fm.isbn.is_some() || fm.copyright.is_some()
 		|| fm.rights.is_some() || fm.ai_declaration.is_some() || fm.website.is_some() || fm.toolchain
+}
+
+/// Does the doc tree state a revision, so the template's meta/colophon page is worth composing? A doc
+/// root always sets `meta-data` with at least one row, or names an author, so this holds for every doc.
+fn fm_has_doc_meta(fm: &FrontMatter) -> bool {
+	!fm.meta_rows.is_empty() || !fm.author.is_empty()
 }
 
 /// A rigid vertical spacer that a page top does not discard, so front-matter elements sit at fixed
@@ -2454,6 +2491,220 @@ fn fm_meta_page(
 		nodes.extend(broken);
 	}
 	Ok(())
+}
+
+/// Sets the documentation template's meta/colophon page (`template.typ`'s `meta-page`): a bordered
+/// Ver/Date/Author(s)/Notes table at the top carrying the one revision row -- its version, date, author
+/// with the "Made with AI" declaration mark beneath the name, and its notes with the reading time
+/// appended -- then, seated at the page foot, the acknowledgement paragraph, the copyright line, the
+/// "created using" line and the footer logo. The template `place`s the foot block against the page
+/// bottom; here the foot block is measured and a rigid spacer drops it there, so the whole page sets as
+/// one flow without a second leaf. The footer logo is drawn into the page here rather than by `decorate`,
+/// which seats the folio footer on body pages only and leaves the front matter clean.
+fn fm_doc_meta_page(
+	nodes:	&mut Vec<Node>,
+	fonts:	&Arc<FontSet>,
+	geom:	PageGeometry,
+	style:	Style,
+	fm:		&FrontMatter,
+)
+	-> Outcome<()>
+{
+	let measure	= geom.content_width();
+	let h		= geom.content_height();
+
+	// The version table, at the very top of the content box, exactly as the template sets it flush under
+	// the top margin.
+	let table	= res!(build_meta_table(fm));
+	let refs:	HashMap<String, String>	= HashMap::new();
+	let tnode	= res!(table::lower(fonts.clone(), style, measure, &table, &refs));
+	let table_h	= node_vext(&tnode);
+	nodes.push(tnode);
+
+	// The foot block: the acknowledgement, the copyright line, the toolchain line and the footer logo,
+	// built into a buffer so its height is known and a spacer can drop it to the page foot. The gaps
+	// between the four elements approximate the template's `place(bottom, dy: ..)` offsets.
+	let mut foot:	Vec<Node>	= Vec::new();
+	let mut foot_h				= Sp::ZERO;
+	let gap						= Sp(style.body_size.raw() * 3 / 4);
+
+	if let Some(ack) = &fm.acknowledgement {
+		let size	= Sp(style.body_size.raw() * 85 / 100);
+		let broken	= res!(break_paragraph(fonts.clone(), Role::Body, Dir::Ltr, size, ack, measure, Sp(size.raw() * 6 / 5)));
+		for n in &broken { foot_h += node_vext(n); }
+		foot.extend(broken);
+	}
+	if let Some(cr) = &fm.copyright {
+		foot.push(Node::Glue(Glue::fixed(gap)));
+		foot_h += gap;
+		let size	= style.body_size;
+		let broken	= res!(break_paragraph(fonts.clone(), Role::Body, Dir::Ltr, size, cr, measure, Sp(size.raw() * 6 / 5)));
+		for n in &broken { foot_h += node_vext(n); }
+		foot.extend(broken);
+	}
+	// The toolchain line, the template's fixed "created using" credit for the doc idiom.
+	{
+		foot.push(Node::Glue(Glue::fixed(gap)));
+		foot_h += gap;
+		let size	= Sp(style.body_size.raw() * 3 / 4);
+		let line	= "This document was created using Typst (built using Rust).";
+		let broken	= res!(break_paragraph(fonts.clone(), Role::Body, Dir::Ltr, size, line, measure, Sp(size.raw() * 6 / 5)));
+		for n in &broken { foot_h += node_vext(n); }
+		foot.extend(broken);
+	}
+	if let Some(path) = &fm.footer_logo {
+		if let Ok(graphic) = image_at_height(fonts, path, 18.0) {
+			let logo = Leaf::graphic(graphic);
+			let lh	 = logo.dims.height + logo.dims.depth;
+			let big	 = Sp(style.body_size.raw() * 3 / 2);	// a little more air above the logo
+			foot.push(Node::Glue(Glue::fixed(big)));
+			foot_h += big + lh;
+			foot.push(Node::HBox(BoxNode::new(vec![Node::Leaf(logo)], Dims::new(measure, lh, Sp::ZERO))));
+		}
+	}
+
+	// Drop the foot block to the page bottom: a rigid spacer taking up the slack between the table and the
+	// foot. A page too short for both simply sets them adjacent rather than overflowing to a second leaf.
+	let used = table_h + foot_h;
+	if h > used {
+		nodes.push(fm_spacer(h - used));
+	}
+	nodes.extend(foot);
+	Ok(())
+}
+
+/// Builds the meta page's Ver/Date/Author(s)/Notes table from the doc's revision rows. A column every row
+/// leaves blank is dropped (the template's `filled` test): Author and Notes always stand, Ver and Date
+/// only when some row sets them. Each row's author cell carries the declaration mark stacked beneath the
+/// name, and the last row's notes take the reading time appended -- matching the template's `meta-page`
+/// table with its `2fr, 2fr, 4fr, 6fr` columns.
+fn build_meta_table(fm: &FrontMatter) -> Outcome<Table> {
+	let has_ver	= fm.meta_rows.iter().any(|r| r.version.as_deref().unwrap_or("") != "");
+	let has_date	= fm.meta_rows.iter().any(|r| r.date.as_deref().unwrap_or("") != "");
+
+	let mut weights:	Vec<f64>		= Vec::new();
+	let mut header:		Vec<Cell>	= Vec::new();
+	if has_ver {
+		weights.push(2.0);
+		header.push(Cell::rich(vec![Segment::strong("Ver")], Align::Centre));
+	}
+	if has_date {
+		weights.push(2.0);
+		header.push(Cell::rich(vec![Segment::strong("Date")], Align::Centre));
+	}
+	weights.push(4.0);
+	header.push(Cell::rich(vec![Segment::strong("Author(s)")], Align::Left));
+	weights.push(6.0);
+	header.push(Cell::rich(vec![Segment::strong("Notes")], Align::Left));
+
+	let mut rows = vec![Row::new(header)];
+	let last = fm.meta_rows.len().saturating_sub(1);
+	for (i, mr) in fm.meta_rows.iter().enumerate() {
+		let mut cells: Vec<Cell> = Vec::new();
+		if has_ver {
+			cells.push(Cell::rich(vec![Segment::text(mr.version.clone().unwrap_or_default())], Align::Centre));
+		}
+		if has_date {
+			cells.push(Cell::rich(vec![Segment::text(mr.date.clone().unwrap_or_default())], Align::Centre));
+		}
+		// The author cell carries the name and, where the row declares one, the AI mark beneath it.
+		let author_cell = match (&mr.ai_mark_path, &mr.ai_mark_words) {
+			(Some(path), Some(words)) => {
+				let mark = crate::table::CellMark {
+					path:	path.clone(),
+					height:	Sp::from_pt(36.0),	// the template's `image(.., height: 36pt)`
+					words:	words.clone(),
+				};
+				Cell::rich_with_mark(vec![Segment::text(mr.authors.clone())], Align::Left, mark)
+			},
+			_ => Cell::rich(vec![Segment::text(mr.authors.clone())], Align::Left),
+		};
+		cells.push(author_cell);
+		// The reading time is appended to the last row's notes only, as the template does.
+		let notes = mr.notes.clone().unwrap_or_default();
+		let notes = match (i == last, fm.reading_min) {
+			(true, Some(m)) => if notes.is_empty() {
+				fmt!("Reading time: {} [min]", m)
+			} else {
+				fmt!("{} Reading time: {} [min]", notes, m)
+			},
+			_ => notes,
+		};
+		cells.push(Cell::rich(vec![Segment::text(notes)], Align::Left));
+		rows.push(Row::new(cells));
+	}
+
+	Ok(Table::with_weights(true, rows, weights))
+}
+
+/// Counts the words in a block stream, matching the template's reading-time counter, which steps once per
+/// maximal run of letters (`\p{L}+`) as the body renders. Every text-bearing block contributes -- prose,
+/// headings, list items, table cells, figure captions, code and references -- so the tally tracks Typst's
+/// own `words.final()` closely; the reading time is that count over the average reading speed.
+pub(crate) fn count_words(blocks: &[Block]) -> usize {
+	fn count_str(s: &str, n: &mut usize) {
+		let mut in_word = false;
+		for ch in s.chars() {
+			if ch.is_alphabetic() {
+				if !in_word { *n += 1; in_word = true; }
+			} else {
+				in_word = false;
+			}
+		}
+	}
+	fn count_segs(segs: &[Segment], n: &mut usize) {
+		for seg in segs {
+			match seg {
+				Segment::Text(t) | Segment::Strong(t) | Segment::Emph(t) | Segment::BoldItalic(t)
+				| Segment::Super(t) | Segment::Code(t)	=> count_str(t, n),
+				Segment::Glossary { display, .. }		=> count_str(display, n),
+				Segment::Footnote { note }				=> count_segs(note, n),
+				Segment::Cite(keys)						=> for k in keys { count_str(k, n); },
+				Segment::PageRef(_) | Segment::Math(_)	=> {},
+			}
+		}
+	}
+	fn count_cells(table: &Table, n: &mut usize) {
+		for row in &table.rows {
+			for cell in &row.cells {
+				count_segs(&cell.content, n);
+			}
+		}
+	}
+	let mut n = 0usize;
+	for b in blocks {
+		match b {
+			Block::Heading { segments, .. }		=> count_segs(segments, &mut n),
+			Block::Paragraph { text }			=> count_str(text, &mut n),
+			Block::RichParagraph { segments }	=> count_segs(segments, &mut n),
+			Block::List { items, .. }			=> for it in items { count_segs(it, &mut n); },
+			Block::Code { lines }				=> for l in lines { count_str(l, &mut n); },
+			Block::Table(t)						=> count_cells(t, &mut n),
+			Block::Figure { caption, .. }		=> if let Some(c) = caption { count_str(c, &mut n); },
+			Block::TableFigure { table, caption, .. } => {
+				count_cells(table, &mut n);
+				if let Some(c) = caption { count_segs(c, &mut n); }
+			},
+			Block::ImageFigure { caption, .. } | Block::CodeFigure { caption, .. }
+												=> if let Some(c) = caption { count_segs(c, &mut n); },
+			Block::BackMatterHeading { title }	=> count_str(title, &mut n),
+			Block::Reference { runs }			=> for (t, _) in runs { count_str(t, &mut n); },
+			Block::Equation { .. } | Block::Rule { .. } | Block::Image { .. }
+			| Block::SectionBanner { .. }		=> {},
+		}
+	}
+	n
+}
+
+/// The vertical extent a node occupies in a flow: a box's height plus depth, a glue's natural size, a
+/// leaf's height plus depth. Anchors and penalties take no space.
+fn node_vext(n: &Node) -> Sp {
+	match n {
+		Node::HBox(b) | Node::VBox(b)	=> b.dims.height + b.dims.depth,
+		Node::Leaf(l)					=> l.dims.height + l.dims.depth,
+		Node::Glue(g)					=> g.natural,
+		_								=> Sp::ZERO,
+	}
 }
 
 /// Sets the dedication page: the dedication centred, in italic, about the vertical centre.
@@ -3295,7 +3546,7 @@ fn section_banner(
 	// The logo, loaded 30 pt tall, its right edge one page margin in from the page's right edge (the content
 	// right edge) and its box centred on the band's vertical middle. Its own ops are in a top-left frame,
 	// y down; a plain translation seats them. A logo that will not load draws the bar alone.
-	if let Ok(logo) = footer_logo_graphic(&fonts, path, logo_h as f64) {
+	if let Ok(logo) = image_at_height(&fonts, path, logo_h as f64) {
 		let lw			= logo.dims.width.to_pt() as f32;
 		let lh			= (logo.dims.height + logo.dims.depth).to_pt() as f32;
 		let right		= x1 - inside_pt;			// 2.5 cm in from the page right edge = the content right edge
@@ -3347,11 +3598,11 @@ fn rule_divider(nodes: &mut Vec<Node>, measure: Sp, width: Length, thickness: f6
 	nodes.push(Node::HBox(BoxNode::new(vec![Node::Leaf(Leaf::graphic(graphic))], Dims::new(measure, h, Sp::ZERO))));
 }
 
-/// Builds the footer logo graphic once: the image at `path` loaded (an SVG as its own scaled paths, a
-/// raster to fill its box) at the drawn height `h`, its ops seated at the origin so a page can place it
-/// at the foot. The height fixes the size and the width follows the aspect, matching the template's
-/// `image(footer-left-logo-path, height: 18pt)`.
-fn footer_logo_graphic(fonts: &Arc<FontSet>, path: &str, h: f64) -> Outcome<Graphic> {
+/// Loads an image at a fixed drawn height: the image at `path` read (an SVG as its own scaled paths, a
+/// raster to fill its box) at height `h`, its ops seated at the origin so a caller can place it. The
+/// height fixes the size and the width follows the aspect, matching the template's `image(.., height: Npt)`.
+/// Used for the page footer logo, and for the meta page's declaration mark within a table cell.
+pub(crate) fn image_at_height(fonts: &Arc<FontSet>, path: &str, h: f64) -> Outcome<Graphic> {
 	let height = Some(Length::Abs(h));
 	// A wide box so the height hint, not the measure, governs the size; the picture keeps its aspect.
 	let box_w	= Sp::from_pt(1000.0);
@@ -3392,7 +3643,7 @@ pub fn decorate(
 	let content_width	= geom.content_width();
 	// The documentation template seats a logo at the left of every page footer. It is loaded once and
 	// placed on each body page; a logo that will not load leaves the footer to the folio alone.
-	let footer = footer_logo.and_then(|p| footer_logo_graphic(fonts, p, 18.0).ok().map(Arc::new));
+	let footer = footer_logo.and_then(|p| image_at_height(fonts, p, 18.0).ok().map(Arc::new));
 	// The body opens on this physical page; the printed folio restarts at one here, so a body page's
 	// folio is its physical page less the front matter before it. A run with no headings (a lone
 	// manuscript) leaves `body_start_page` zero, so the whole document is body and the folio is physical.
@@ -3500,4 +3751,77 @@ pub fn decorate(
 fn centre_x(geom: PageGeometry, w: Sp) -> Sp {
 	let slack = (geom.content_width().raw() - w.raw()).max(0) / 2;
 	geom.content_left() + Sp(slack)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn count_words_counts_letter_runs_across_blocks() {
+		// Letter runs, as the template's `\p{L}+` counter steps: "don't" is two runs, a bare number none.
+		let blocks = vec![
+			Block::Heading { level: 1, segments: vec![Segment::text("The Purpose")], label: None },
+			Block::Paragraph { text: "It reads a document and writes 42 pages.".to_string() },
+			Block::List { ordered: false, items: vec![vec![Segment::strong("one two")]] },
+		];
+		// Heading: 2; paragraph: "It reads a document and writes pages" = 7 (the "42" counts none);
+		// list item: 2. Total 11.
+		assert_eq!(count_words(&blocks), 11);
+	}
+
+	#[test]
+	fn build_meta_table_appends_reading_time_and_mark() {
+		let fm = FrontMatter {
+			title:			"Austenite".to_string(),
+			subtitle:		None,
+			author:			"J. D. Hoogland".to_string(),
+			cover_image:	None,
+			logo_image:		None,
+			publisher:		None,
+			edition:		None,
+			isbn:			None,
+			copyright:		Some("Copyright © 12025 Oxedyne. All rights reserved.".to_string()),
+			rights:			None,
+			ai_declaration:	None,
+			website:		None,
+			toolchain:		false,
+			dedication:		None,
+			about_author:	None,
+			title_size:		Sp::from_pt(28.0),
+			subtitle_size:	Sp::from_pt(16.0),
+			author_size:	Sp::from_pt(17.0),
+			back_title_size:	Sp::from_pt(14.0),
+			sidebar_grey:	Some(240),
+			sidebar_frac:	0.45,
+			title_smallcaps:	true,
+			top_logo:		None,
+			top_logo_width:		Sp::ZERO,
+			bottom_logo:	None,
+			bottom_logo_width:	Sp::ZERO,
+			footer_logo:	None,
+			meta_rows:		vec![MetaRow {
+				version:		Some("0.1.0".to_string()),
+				date:			Some("12026-08-08".to_string()),
+				authors:		"J. D. Hoogland".to_string(),
+				notes:			Some("Created.".to_string()),
+				ai_mark_path:	Some("assets/svg/doc_made_with_ai_opt.svg".to_string()),
+				ai_mark_words:	Some("Made with AI".to_string()),
+			}],
+			reading_min:	Some(51),
+			acknowledgement:	Some("We acknowledge...".to_string()),
+		};
+		let table = build_meta_table(&fm).expect("meta table builds");
+		assert_eq!(table.rows.len(), 2, "one header row and one revision row");
+		assert!(table.header, "the first row is the header");
+		// The author cell carries the declaration mark stacked beneath the name (column index 2: Ver, Date, Author).
+		assert!(table.rows[1].cells[2].mark.is_some(), "the author cell carries the AI mark");
+		// The notes cell has the reading time appended to the authored notes.
+		let notes = match &table.rows[1].cells[3].content[0] {
+			Segment::Text(t)	=> t.clone(),
+			_					=> String::new(),
+		};
+		assert!(notes.contains("Created.") && notes.contains("Reading time: 51 [min]"),
+			"the notes cell appends the reading time: {:?}", notes);
+	}
 }

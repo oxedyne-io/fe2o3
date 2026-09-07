@@ -62,7 +62,7 @@ pub fn set_term_dict(dict: HashMap<String, String>) -> Outcome<()> {
 /// The display value a `term-dict` key resolves to, or `None` when no map is installed or it holds no
 /// such key. A poisoned lock reads as absent rather than failing the parse: a missing value falls back
 /// to the key text, which is exactly the safe degradation here.
-fn term_value(key: &str) -> Option<String> {
+pub(crate) fn term_value(key: &str) -> Option<String> {
 	match TERM_DICT.read() {
 		Ok(guard)	=> guard.as_ref().and_then(|m| m.get(key).cloned()),
 		Err(_)		=> None,

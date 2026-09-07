@@ -63,6 +63,17 @@ pub enum Align {
 	Right,
 }
 
+/// An image mark stacked beneath a cell's text: the meta page's "Made with AI" chip and its caption,
+/// linked in the Typst source and rendered here as the image and its words alone (the link is dropped,
+/// as the PDF writer emits no image link annotation). The mark occupies its own band under the cell's
+/// last text line, the image seated left with the caption beside it.
+#[derive(Clone, Debug)]
+pub struct CellMark {
+	pub path:	String,	// the mark image, resolved against the image base directory
+	pub height:	Sp,		// the drawn image height
+	pub words:	String,	// the caption set beside the image
+}
+
 /// One cell: its inline content, and how that content aligns in the column. A cell carries a run of
 /// [`Segment`]s -- a bold header, an italic word, a superscript dagger or an in-cell maths span each set
 /// with its own face -- broken to the column width exactly as a rich paragraph is broken to the measure.
@@ -70,20 +81,27 @@ pub enum Align {
 pub struct Cell {
 	pub content:	Vec<Segment>,
 	pub align:		Align,
+	pub mark:		Option<CellMark>,	// an image mark stacked beneath the text, the meta page's AI chip
 }
 
 impl Cell {
 	pub fn new<S: Into<String>>(text: S) -> Self {
-		Self { content: vec![Segment::text(text)], align: Align::Left }
+		Self { content: vec![Segment::text(text)], align: Align::Left, mark: None }
 	}
 
 	pub fn aligned<S: Into<String>>(text: S, align: Align) -> Self {
-		Self { content: vec![Segment::text(text)], align }
+		Self { content: vec![Segment::text(text)], align, mark: None }
 	}
 
 	/// A cell carrying a run of rich segments -- the form the reader builds from a Typst cell's markup.
 	pub fn rich(content: Vec<Segment>, align: Align) -> Self {
-		Self { content, align }
+		Self { content, align, mark: None }
+	}
+
+	/// A cell carrying a run of rich segments and an image mark stacked beneath them -- the meta page's
+	/// author cell, whose name is followed by the "Made with AI" chip and its caption.
+	pub fn rich_with_mark(content: Vec<Segment>, align: Align, mark: CellMark) -> Self {
+		Self { content, align, mark: Some(mark) }
 	}
 }
 
@@ -221,8 +239,15 @@ pub fn lower(
 		let mut cells = Vec::with_capacity(ncols);
 		let mut bands = 0usize;
 		for c in 0..ncols {
-			let lines = res!(break_cell(
+			let mut lines = res!(break_cell(
 				fonts.clone(), bases[r], size, &piece_grid[r][c], colwidth[c], cell_leading));
+			// An image mark stacked beneath the cell's text takes its own band under the last line. A mark
+			// whose image will not load leaves the cell to its text alone, as a title logo degrades.
+			if let Some(mark) = rows[r].cells.get(c).and_then(|cell| cell.mark.as_ref()) {
+				if let Ok(line) = mark_line(fonts.clone(), size, mark) {
+					lines.push(line);
+				}
+			}
 			bands = bands.max(lines.len());
 			cells.push(lines);
 		}
@@ -296,6 +321,37 @@ pub fn lower(
 
 	let dims = Dims::new(table_width, total_h, Sp::ZERO);
 	Ok(Node::VBox(BoxNode::new(children, dims)))
+}
+
+/// Builds a cell's image mark as one line: the image seated at the left, then a gap, then the caption
+/// beside it. The image is drawn at the mark's fixed height and the caption set a little smaller; the
+/// caption is lowered so it sits about the image's vertical middle rather than clinging to its top, since
+/// a band tops-aligns its leaves. The line's extent is the image height, so its band clears the chip.
+fn mark_line(
+	fonts:	Arc<FontSet>,
+	size:	Sp,
+	mark:	&CellMark,
+)
+	-> Outcome<CellLine>
+{
+	let graphic	= res!(crate::doc::image_at_height(&fonts, &mark.path, mark.height.to_pt()));
+	let img		= Leaf::graphic(graphic);
+	let img_w	= img.dims.width;
+	let img_h	= img.dims.height;
+
+	let cap_size	= Sp(size.raw() * 82 / 100);
+	let shaped		= res!(ShapedText::new(fonts, Role::Body, Dir::Ltr, cap_size, &mark.words));
+	let cd			= shaped.dims();
+	let mut words	= Leaf::text(shaped);
+	// Lower the caption to about the image's vertical middle; the band tops-aligns its leaves, so without
+	// the shift the words would cling to the chip's top edge.
+	let drop		= (img_h.raw() - cd.height.raw()).max(0) / 2;
+	words.shift		= Sp(drop);
+
+	let gap		= Sp::from_pt(6.0);
+	let children	= vec![Node::Leaf(img), Node::Glue(Glue::fixed(gap)), Node::Leaf(words)];
+	let width	= img_w + gap + cd.width;
+	Ok(CellLine { children, width, height: img_h, depth: Sp::ZERO })
 }
 
 /// The base role a row's plain text sets in: bold for a header row, the body face otherwise. Authored

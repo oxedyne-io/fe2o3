@@ -151,6 +151,32 @@ fn load_book(root_dir: &Path, root_src: &str) -> Outcome<BookSpec> {
 // │ DOCUMENTATION IDIOM                                                        │
 // └───────────────────────────────────────────────────────────────────────────┘
 
+/// The template's `avg_reading_speed`, in words per minute, used to turn the word count into the reading
+/// time the meta page shows.
+const AVG_READING_SPEED: usize = 230;
+
+/// The acknowledgement paragraph the documentation template seats at the foot of its meta page, a fixed
+/// constant of the doc idiom rather than a `meta-data` field (`template.typ`'s `meta-page`).
+const DOC_ACKNOWLEDGEMENT: &str = "We acknowledge the Indigenous peoples who have been traditional \
+custodians of lands and waters around the world, past and present. Through their languages, stories, and \
+practices, they have sought to maintain living connections to humanity's deepest roots and the ancient \
+wisdom of sustainable coexistence with Earth's ecosystems.";
+
+/// Maps an AI-declaration slug to its mark image path and caption, mirroring the template's
+/// `ai-declarations` dictionary and its `doc` medium. The path is image-base-relative, resolved the same
+/// way as the title logos; an unknown slug yields no mark, so the author cell sets the name alone.
+fn ai_declaration_mark(slug: &str) -> Option<(String, String)> {
+	let (file, words) = match slug {
+		"no-ai"			=> ("doc_made_with_no_ai_opt.svg",			"Made with no AI"),
+		"some-ai"		=> ("doc_made_with_some_ai_opt.svg",		"Made with some AI"),
+		"with-ai"		=> ("doc_made_with_ai_opt.svg",				"Made with AI"),
+		"mostly-ai"		=> ("doc_made_with_ai_mostly_opt.svg",		"Made mostly with AI"),
+		"entirely-ai"	=> ("doc_made_with_ai_entirely_opt.svg",	"Made with AI entirely"),
+		_				=> return None,
+	};
+	Some((fmt!("assets/svg/{}", file), words.to_string()))
+}
+
 /// The documentation (`doc.with`) path: the oxedyne doc trees (Hematite, Austenite) carry no
 /// `config.typ`. Their A4 page and 2.5 cm margins live in the shared `template.typ`, and the body size
 /// is the `text-size:` argument of the root's `#show: doc.with(...)` call. Geometry and type are read
@@ -177,7 +203,12 @@ fn load_doc(root_dir: &Path, root_src: &str) -> Outcome<BookSpec> {
 	// the heading path falls back to the body bold, which is exactly what the template's show rule sets.
 	let heading:	Option<Arc<Font>>	= None;
 	let (blocks, skips)	= res!(assemble(root_src, root_dir));
-	let front		= read_doc_front_matter(root_dir, root_src, &raw, &title);
+	let mut front	= read_doc_front_matter(root_dir, root_src, &raw, &title);
+
+	// The reading time the meta page appends to its notes cell: the whole-document word count over the
+	// template's 230 words/min, rounded up, matching its `calc.ceil(words.final() / avg_reading_speed)`.
+	let words		= crate::doc::count_words(&blocks);
+	front.reading_min	= Some(((words + AVG_READING_SPEED - 1) / AVG_READING_SPEED) as u32);
 
 	// A doc tree names its bibliography, glossary and index through raw Typst calls the reader skips, not
 	// the book's `meta-data.bibliography` field, so no reference back matter is assembled here.
@@ -244,6 +275,36 @@ fn read_doc_front_matter(root_dir: &Path, root_src: &str, raw: &RawStyle, title:
 	let meta		= meta_block(root_src).unwrap_or_default();
 	let author		= string_field(&meta, "authors").unwrap_or_default();
 
+	// The revision rows the template's meta/colophon page draws: each row's version, date, notes, and the
+	// AI declaration whose slug picks the mark image and its caption (a `declaration-words` field rescopes
+	// the caption without changing the mark). A doc tree may state several rows, newest first.
+	let meta_rows: Vec<crate::doc::MetaRow> = meta_rows(&meta).iter().map(|row| {
+		let (ai_mark_path, ai_mark_words) = match string_field(row, "declaration") {
+			Some(slug)	=> match ai_declaration_mark(&slug) {
+				Some((path, words))	=> {
+					let words = string_field(row, "declaration-words").unwrap_or(words);
+					(Some(path), Some(words))
+				},
+				None				=> (None, None),
+			},
+			None		=> (None, None),
+		};
+		crate::doc::MetaRow {
+			version:	string_field(row, "version"),
+			date:		string_field(row, "date"),
+			authors:	string_field(row, "authors").unwrap_or_default(),
+			notes:		string_field(row, "notes"),
+			ai_mark_path,
+			ai_mark_words,
+		}
+	}).collect();
+	// The colophon furniture the template fixes for the doc idiom: the acknowledgement paragraph, and the
+	// copyright line composed from the organisation the term dictionary names (`#t("org")`), falling back
+	// to Oxedyne. Both are template constants rather than `meta-data`, so they are set here for every doc.
+	let acknowledgement	= Some(DOC_ACKNOWLEDGEMENT.to_string());
+	let org				= crate::lang::parse::term_value("org").unwrap_or_else(|| "Oxedyne".to_string());
+	let copyright		= Some(fmt!("Copyright © 12025 {}. All rights reserved.", org));
+
 	// The sidebar width is `margins.title_page` in the shared template (a percentage of the page); the fill
 	// is the `title-colour` the call names, resolved to a grey level. A doc tree always draws the sidebar,
 	// so `sidebar_grey` is set here (marking the two-column idiom) even when the call omits its colour.
@@ -271,7 +332,7 @@ fn read_doc_front_matter(root_dir: &Path, root_src: &str, raw: &RawStyle, title:
 		publisher:		None,
 		edition:		None,
 		isbn:			None,
-		copyright:		None,
+		copyright,
 		rights:			None,
 		ai_declaration:	None,
 		website:		None,
@@ -290,6 +351,9 @@ fn read_doc_front_matter(root_dir: &Path, root_src: &str, raw: &RawStyle, title:
 		bottom_logo,
 		bottom_logo_width:	Sp::from_pt(bottom_w),
 		footer_logo,
+		meta_rows,
+		reading_min:	None,	// set by `load_doc`, which has the body blocks to count
+		acknowledgement,
 	}
 }
 
@@ -594,6 +658,10 @@ fn read_front_matter(root_src: &str, config_src: &str, title: &str) -> FrontMatt
 		bottom_logo:		None,
 		bottom_logo_width:	Sp::ZERO,
 		footer_logo:		None,
+		// The doc template's meta/colophon fields; a book draws its own imprint page, not the doc colophon.
+		meta_rows:			Vec::new(),
+		reading_min:		None,
+		acknowledgement:	None,
 	}
 }
 
@@ -631,6 +699,45 @@ fn meta_block(src: &str) -> Option<String> {
 		i += 1;
 	}
 	None
+}
+
+/// Splits a `meta-data` block into its revision rows: the text inside each top-level parenthesised tuple,
+/// in source order. Nested parentheses and strings are respected, so a row whose value carries a comma or
+/// a bracket is not split early. A block with no nested tuple (a bare single row) yields no rows.
+fn meta_rows(block: &str) -> Vec<String> {
+	let bytes	= block.as_bytes();
+	let mut rows:	Vec<String>	= Vec::new();
+	let mut depth	= 0i32;
+	let mut in_str	= false;
+	let mut esc		= false;
+	let mut start	= 0usize;
+	let mut i		= 0usize;
+	while i < bytes.len() {
+		let c = bytes[i] as char;
+		if in_str {
+			if esc			{ esc = false; }
+			else if c == '\\'	{ esc = true; }
+			else if c == '"'	{ in_str = false; }
+			i += 1;
+			continue;
+		}
+		match c {
+			'"'	=> in_str = true,
+			'('	=> {
+				if depth == 0 { start = i + 1; }
+				depth += 1;
+			},
+			')'	=> {
+				depth -= 1;
+				if depth == 0 {
+					rows.push(block[start..i].to_string());
+				}
+			},
+			_	=> {},
+		}
+		i += 1;
+	}
+	rows
 }
 
 /// The string a `name: "..."` field binds: the first `"..."` in the field's value, which runs to the
@@ -1329,11 +1436,73 @@ mod tests {
 		assert_eq!(fm.title, "Austenite");
 		assert_eq!(fm.subtitle.as_deref(), Some("Design Document"));
 		assert_eq!(fm.author, "J. D. Hoogland");
-		assert!(fm.isbn.is_none() && fm.copyright.is_none(), "a doc tree carries no imprint");
+		// A doc tree carries no book imprint (no ISBN), but it does compose the template's colophon: the
+		// revision fields, the copyright line and the acknowledgement paragraph the meta page seats.
+		assert!(fm.isbn.is_none(), "a doc tree carries no book imprint");
+		assert_eq!(fm.meta_rows.len(), 1, "one revision row");
+		assert_eq!(fm.meta_rows[0].version.as_deref(), Some("0.1.0"));
+		assert_eq!(fm.meta_rows[0].notes.as_deref(), Some("Initial."));
+		assert!(fm.copyright.as_deref().unwrap_or_default().contains("All rights reserved."),
+			"a doc meta page carries a copyright line");
+		assert!(fm.acknowledgement.is_some(), "a doc meta page carries an acknowledgement");
 		// A doc tree always draws the template's two-column title page, so the sidebar is marked even when
 		// the miniature root names no colour; the fraction falls to the template default with no template file.
 		assert!(fm.sidebar_grey.is_some(), "a doc title page draws the sidebar");
 		assert!((fm.sidebar_frac - 0.45).abs() < 1e-9, "the sidebar default fraction is 0.45");
+	}
+
+	#[test]
+	fn test_doc_front_matter_reads_declaration_mark_07() {
+		let root = r#"
+#show: doc.with(
+  title: [Austenite],
+  footer-left-logo-path: "assets/svg/fe2o3_logo_text_right.svg",
+  meta-data: (
+    ( version: "0.1.0", date: "12026-08-08", authors: "J. D. Hoogland", declaration: "with-ai", notes: "Created." ),
+  ),
+)
+= Purpose
+"#;
+		let raw = RawStyle {
+			body_pt: 11.0, leading_em: 0.65, par_skip_em: 0.65, indent_em: 0.0,
+			chap_num_pt: 54.0, chap_grid: [72.0, 8.0, 36.0, 20.0],
+			h1_pt: 14.0, h2_pt: 12.0, h3_pt: 13.0, h4_pt: 12.0,
+		};
+		let fm = read_doc_front_matter(std::path::Path::new("/nonexistent"), root, &raw, "Austenite");
+		assert_eq!(fm.meta_rows.len(), 1, "one revision row");
+		let mr = &fm.meta_rows[0];
+		assert_eq!(mr.date.as_deref(), Some("12026-08-08"));
+		assert_eq!(mr.ai_mark_words.as_deref(), Some("Made with AI"));
+		assert!(mr.ai_mark_path.as_deref().unwrap_or_default().ends_with("doc_made_with_ai_opt.svg"),
+			"the with-ai slug picks the doc mark image");
+		assert_eq!(fm.footer_logo.as_deref(), Some("assets/svg/fe2o3_logo_text_right.svg"));
+	}
+
+	#[test]
+	fn test_doc_front_matter_reads_multiple_rows_and_custom_words_09() {
+		let root = r#"
+#show: doc.with(
+  title: [Hematite],
+  meta-data: (
+    ( version: "2.0.0", date: "12026-04-11", authors: "J. D. Hoogland", declaration: "entirely-ai", declaration-words: "Additions made entirely with AI", notes: "Restructured." ),
+    ( version: "1.0.0", date: "12023-10-01", authors: "J. D. Hoogland", declaration: "some-ai", notes: "Initial release." ),
+  ),
+)
+= Purpose
+"#;
+		let raw = RawStyle {
+			body_pt: 11.0, leading_em: 0.65, par_skip_em: 0.65, indent_em: 0.0,
+			chap_num_pt: 54.0, chap_grid: [72.0, 8.0, 36.0, 20.0],
+			h1_pt: 14.0, h2_pt: 12.0, h3_pt: 13.0, h4_pt: 12.0,
+		};
+		let fm = read_doc_front_matter(std::path::Path::new("/nonexistent"), root, &raw, "Hematite");
+		assert_eq!(fm.meta_rows.len(), 2, "both revision rows are read");
+		assert_eq!(fm.meta_rows[0].version.as_deref(), Some("2.0.0"));
+		// A `declaration-words` rescopes the caption without changing the mark image.
+		assert_eq!(fm.meta_rows[0].ai_mark_words.as_deref(), Some("Additions made entirely with AI"));
+		assert!(fm.meta_rows[0].ai_mark_path.as_deref().unwrap_or_default().ends_with("doc_made_with_ai_entirely_opt.svg"));
+		assert_eq!(fm.meta_rows[1].version.as_deref(), Some("1.0.0"));
+		assert_eq!(fm.meta_rows[1].ai_mark_words.as_deref(), Some("Made with some AI"));
 	}
 
 	#[test]
