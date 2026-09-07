@@ -228,7 +228,21 @@ impl Ledger {
 
 	/// Records an anchor's placement, replacing any earlier record of the same identity within this
 	/// pass. The last placement wins because a pass overwrites a stale one as it re-lays the stream.
+	///
+	/// The first heading recorded fixes where the body opens, and the bibliography marker (the only
+	/// Citation-kind anchor) where the back matter does. The front matter sets only Label anchors, so the
+	/// first heading to arrive is the body's opening chapter or section -- and it is caught here, as it is
+	/// recorded, whether it reaches the driver as a top-level node (a chapter opener) or nested inside a
+	/// keep box (a `#section-banner` section's inline level-1 heading, the `DocInline` idiom). Detecting it
+	/// only among top-level nodes left the inline idiom with a zero `body_start_page`, so its front-matter
+	/// pages were mistaken for body pages and stamped with a folio and footer logo.
 	pub fn record(&mut self, anchor: Anchor) {
+		if self.body_start_page == 0 && anchor.id.kind == AnchorKind::Heading {
+			self.body_start_page = anchor.pos.page;
+		}
+		if self.back_matter_start_page == 0 && anchor.id.kind == AnchorKind::Citation {
+			self.back_matter_start_page = anchor.pos.page;
+		}
 		self.entries.insert(anchor.id.clone(), anchor);
 	}
 
@@ -338,5 +352,43 @@ impl FromDat for Ledger {
 			entries.insert(a.id.clone(), a);
 		}
 		Ok(Self { entries, total_pages, body_start_page, back_matter_start_page })
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn record_sets_body_start_on_the_first_heading() {
+		// The first heading recorded fixes the body start, whatever page it lands on and however it reached
+		// the ledger -- this is what lets a heading nested in a keep box (the inline-heading idiom) fix the
+		// body start, where detecting it only among top-level nodes left `body_start_page` zero and stamped
+		// the front-matter pages with a folio. A front-matter Label recorded first must not fix it.
+		let mut ledger = Ledger::new();
+		ledger.record(Anchor::new(
+			AnchorId::new(AnchorKind::Label, "frontmatter:contents"),
+			Position::new(3, Sp::ZERO, Sp::ZERO)));
+		assert_eq!(ledger.body_start_page, 0, "a front-matter Label does not open the body");
+
+		ledger.record(Anchor::new(
+			AnchorId::new(AnchorKind::Heading, "01-introduction"),
+			Position::new(4, Sp::ZERO, Sp::ZERO)));
+		assert_eq!(ledger.body_start_page, 4, "the first heading fixes the body start");
+
+		// A later heading does not move it: the body opens once.
+		ledger.record(Anchor::new(
+			AnchorId::new(AnchorKind::Heading, "02-server"),
+			Position::new(9, Sp::ZERO, Sp::ZERO)));
+		assert_eq!(ledger.body_start_page, 4, "a later heading leaves the body start where it was");
+	}
+
+	#[test]
+	fn record_sets_back_matter_start_on_the_citation_marker() {
+		let mut ledger = Ledger::new();
+		ledger.record(Anchor::new(
+			AnchorId::new(AnchorKind::Citation, "bibliography"),
+			Position::new(40, Sp::ZERO, Sp::ZERO)));
+		assert_eq!(ledger.back_matter_start_page, 40, "the bibliography marker opens the back matter");
 	}
 }

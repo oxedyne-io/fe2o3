@@ -30,7 +30,6 @@ use crate::{
 	},
 	ledger::{
 		Anchor,
-		AnchorKind,
 		Ledger,
 		Position,
 	},
@@ -197,17 +196,9 @@ fn compose<M: Metrics>(
 				}
 			},
 			Node::Anchor(id) => {
-				// The first heading recorded fixes where the body opens, so a folio reference can turn a
-				// physical page into the printed folio. Front matter sets no heading anchors, so the first
-				// to arrive here is the body's opening part or chapter.
-				if ledger.body_start_page == 0 && id.kind == AnchorKind::Heading {
-					ledger.body_start_page = page_no;
-				}
-				// The bibliography marker (the only Citation-kind anchor) fixes where the back matter opens,
-				// so its pages drop the running head and centre the folio.
-				if ledger.back_matter_start_page == 0 && id.kind == AnchorKind::Citation {
-					ledger.back_matter_start_page = page_no;
-				}
+				// The body-start and back-matter markers are noticed by `Ledger::record` as the anchor is
+				// recorded, so a heading nested in a keep box (the inline-heading idiom) fixes the body start
+				// exactly as a top-level chapter opener does.
 				ledger.record(Anchor::new(id.clone(), Position::new(page_no, geom.content_left(), y)));
 			},
 			Node::HBox(_) | Node::VBox(_) | Node::Leaf(_) => {
