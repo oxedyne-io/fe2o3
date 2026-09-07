@@ -21,6 +21,7 @@ pub enum Item {
 	Code { lines: Vec<String>, span: Span },	// a ```-fenced block, set verbatim in the mono face
 	Table { spec: TableSpec, span: Span },	// a bare `#table(...)`, not wrapped in a figure
 	Figure { body: FigureBody, caption: Option<Vec<Inline>>, supplement: String, label: Option<String>, span: Span },	// caption: the caption's inline markup
+	Image { path: String, width: Option<Length>, height: Option<Length>, scale: Option<f64>, span: Span },	// a line-leading `#padded-image(...)`/`#image(...)`, set centred without a figure number
 	Rule { width: Length, thickness: f64, grey: u8, span: Span },	// a standalone `#line(length:.., stroke:..)` horizontal divider
 }
 

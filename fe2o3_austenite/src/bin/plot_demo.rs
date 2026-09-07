@@ -70,7 +70,7 @@ fn main() -> Outcome<()> {
 
 	let metrics	= FontMetrics::new(fonts.clone(), Role::Body, Dir::Ltr, style.body_size);
 	let mut out	= res!(driver::run(&document, &metrics, Config::default()));
-	res!(doc::decorate(&mut out.pages, &out.ledger, &heads, &fonts, style, geom, ""));
+	res!(doc::decorate(&mut out.pages, &out.ledger, &heads, &fonts, style, geom, "", None));
 
 	res!(std::fs::create_dir_all(&out_dir));
 	let emitter = Emitter::Svg;

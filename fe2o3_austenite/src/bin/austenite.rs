@@ -205,7 +205,8 @@ fn compile(source: &str, out_dir: &str) -> Outcome<CompileStats> {
 	let mut out				= res!(driver::run(&document, &metrics, Config::default()));
 	mark("driver::run", t_run);
 	let t_decorate			= std::time::Instant::now();
-	res!(doc::decorate(&mut out.pages, &out.ledger, &heads, &fonts, style, geom, &title));
+	let footer_logo			= front.as_ref().and_then(|f| f.footer_logo.as_deref());
+	res!(doc::decorate(&mut out.pages, &out.ledger, &heads, &fonts, style, geom, &title, footer_logo));
 	mark("decorate", t_decorate);
 
 	// Mirror the margins: the driver laid every page at the recto split (binding on the left). A verso

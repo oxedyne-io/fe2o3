@@ -1387,6 +1387,7 @@ struct Capture {
 enum CaptureKind {
 	Figure,			// a `#figure(...)` call, possibly wrapping a table or an image
 	Table,			// a bare `#table(...)` call
+	Image,			// a line-leading `#padded-image(...)` or `#image(...)` set without a figure number
 	Let(String),	// a `#let name = (...)` data array bound to this name
 	Columns,		// a `#columns(n)[ ... ]` wrapper: its body is set single-column
 }
@@ -1403,6 +1404,13 @@ fn capture_opener(trimmed: &str) -> Option<CaptureKind> {
 	}
 	if trimmed.starts_with("#columns(") {
 		return Some(CaptureKind::Columns);
+	}
+	// A section opener draws its logo with a line-leading `#padded-image(...)` (the Pearl section's pearlite
+	// mark), and a bare `#image(...)` places a graphic likewise. Both are set centred without a figure
+	// number, so they are captured here rather than skipped. The hyphen keeps `#image(` from matching the
+	// tail of `#padded-image(`, which is tried first.
+	if trimmed.starts_with("#padded-image(") || trimmed.starts_with("#image(") {
+		return Some(CaptureKind::Image);
 	}
 	let_array_name(trimmed).map(CaptureKind::Let)
 }
@@ -1449,6 +1457,14 @@ fn dispatch_capture(
 		CaptureKind::Figure => {
 			if let Some(item) = parse_figure(&cap.buf, arrays) {
 				items.push(item);
+			}
+		},
+		CaptureKind::Image => {
+			// A line-leading image call: its path and sizing are read the same way a figure's image body is,
+			// then set as a plain centred image with no figure number. A call naming no path draws nothing.
+			let (path, width, height, scale) = image_call(&cap.buf);
+			if !path.is_empty() {
+				items.push(Item::Image { path, width, height, scale, span: Span::new(0, 0) });
 			}
 		},
 		CaptureKind::Columns => {
@@ -2125,6 +2141,23 @@ mod tests {
 		assert!(is_inline_call("claim-label"));
 		assert!(is_inline_call("claim-refs"));
 		assert!(code_skip("#claim-label(<CD18>). Equilibrium appropriation follows.").is_none());
+	}
+
+	/// A line-leading `#padded-image(...)` (a section opener's logo) is set as an [`Item::Image`] carrying
+	/// its path and scale, not skipped as a template call and not wrapped in a numbered figure.
+	#[test]
+	fn line_leading_padded_image_reads_as_image() -> Outcome<()> {
+		let (items, _skips) = res!(document_with_skips(
+			"= Pearl\n\n#padded-image(\"assets/svg/pearlite_logo_text_right.svg\", scale: 45%)\n\nPearl is the format.\n"));
+		let img = res!(items.iter().find_map(|it| match it {
+			Item::Image { path, scale, .. }	=> Some((path.clone(), *scale)),
+			_								=> None,
+		}).ok_or_else(|| err!("no Item::Image was produced for the standalone padded-image"; Test, Bug)));
+		assert_eq!(img.0, "assets/svg/pearlite_logo_text_right.svg", "the image path is read");
+		assert_eq!(img.1, Some(0.45), "the padded-image scale is read as a fraction");
+		// The line must not have been swallowed as a skipped construct, nor turned into a figure.
+		assert!(!items.iter().any(|it| matches!(it, Item::Figure { .. })), "a section logo is not a figure");
+		Ok(())
 	}
 
 	/// `#emph[...]` is the call form of `_..._`: it yields an [`Inline::Emph`] run with the same inner

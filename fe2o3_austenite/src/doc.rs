@@ -200,6 +200,9 @@ pub enum Block {
 	// A standalone `#line(...)` horizontal divider: a stroked rule of the given width (a fraction of the
 	// measure or an absolute length), thickness in points, and grey level, with a paragraph skip either side.
 	Rule { width: Length, thickness: f64, grey: u8 },
+	// A line-leading `#padded-image(...)`/`#image(...)`: the loaded image centred in the measure with a
+	// little space either side, carrying no figure number or caption -- a section opener's logo, not a float.
+	Image { path: String, width: Option<Length>, height: Option<Length>, scale: Option<f64> },
 }
 
 impl Block {
@@ -312,6 +315,11 @@ impl Block {
 	/// One bibliography reference, a sequence of runs each flagged for italic.
 	pub fn reference(runs: Vec<(String, bool)>) -> Self {
 		Self::Reference { runs }
+	}
+
+	/// A plain centred image (a `#padded-image`/`#image` section logo), with any declared sizing.
+	pub fn image(path: String, width: Option<Length>, height: Option<Length>, scale: Option<f64>) -> Self {
+		Self::Image { path, width, height, scale }
 	}
 }
 
@@ -457,6 +465,18 @@ pub struct FrontMatter {
 	pub subtitle_size:	Sp,
 	pub author_size:	Sp,
 	pub back_title_size:	Sp,	// the "About the Author"/"Bibliography" heading size
+	// The documentation template's two-column title page (`template.typ`'s `title-page`): a full-height
+	// coloured sidebar down the left carrying a logo near its top and one near its foot, with the title and
+	// subtitle centred on the white right. `sidebar_grey` marks this idiom -- `Some(luma)` draws it and
+	// `None` keeps the book's plain centred title page. The rest are read from the root's `doc.with` call.
+	pub sidebar_grey:		Option<u8>,	// the sidebar fill as a grey level; None keeps the plain title page
+	pub sidebar_frac:		f64,		// the sidebar width as a fraction of the page width (`margins.title_page`)
+	pub title_smallcaps:	bool,		// whether the title sets in small caps rather than italic
+	pub top_logo:			Option<String>,	// the logo near the sidebar's top
+	pub top_logo_width:		Sp,
+	pub bottom_logo:		Option<String>,	// the logo near the sidebar's foot
+	pub bottom_logo_width:	Sp,
+	pub footer_logo:		Option<String>,	// the logo the template seats at the left of the page footer
 }
 
 /// Turns an authored block list into the composed document, and the heading table the running heads
@@ -765,6 +785,12 @@ pub fn author(
 				}
 				rule_divider(&mut nodes, measure, *width, *thickness, *grey);
 				nodes.push(Node::Glue(Glue::fixed(style.para_skip)));
+				i += 1;
+				first = false;
+				prev_para = false;
+			},
+			Block::Image { path, width, height, scale } => {
+				res!(plain_image(&mut nodes, fonts.clone(), measure, path, *width, *height, *scale));
 				i += 1;
 				first = false;
 				prev_para = false;
@@ -1408,6 +1434,42 @@ fn image_figure(
 	Ok(())
 }
 
+/// Sets a plain centred image with no figure number or caption -- a `#padded-image`/`#image` section
+/// opener's logo. The image is sized and loaded exactly as a figure's is (an SVG drawn as its own scaled
+/// paths, a raster to fill its box, a failed load standing in with the placeholder), then centred in the
+/// measure with the template's 10 pt of padding above and below, so the words after it keep their air.
+fn plain_image(
+	nodes:		&mut Vec<Node>,
+	fonts:		Arc<FontSet>,
+	measure:	Sp,
+	path:		&str,
+	width:		Option<Length>,
+	height:		Option<Length>,
+	scale:		Option<f64>,
+)
+	-> Outcome<()>
+{
+	let graphic = match crate::image::load_figure(path) {
+		Ok(crate::image::Figure::Raster(img))	=> res!(image_graphic(measure, img, width, height, scale)),
+		Ok(crate::image::Figure::Vector(pic))	=> res!(svg_graphic(fonts.clone(), measure, pic, width, height, scale)),
+		Err(_)									=> res!(placeholder(measure)),
+	};
+	let pad = Sp::from_pt(10.0);	// the template's `padded-image` padding, above and below
+	nodes.push(Node::Glue(Glue::fixed(pad)));
+	let leaf	= Leaf::graphic(graphic);
+	let gw		= leaf.dims.width;
+	let gh		= leaf.dims.height + leaf.dims.depth;
+	let lpad	= if measure > gw { Sp((measure.raw() - gw.raw()) / 2) } else { Sp::ZERO };
+	let mut row:	Vec<Node> = Vec::new();
+	if lpad.raw() > 0 {
+		row.push(Node::Glue(Glue::fixed(lpad)));
+	}
+	row.push(Node::Leaf(leaf));
+	nodes.push(Node::HBox(BoxNode::new(row, Dims::new(measure, gh, Sp::ZERO))));
+	nodes.push(Node::Glue(Glue::fixed(pad)));
+	Ok(())
+}
+
 /// Sets a figure drawn by code: the figure's anchors, the built graphic centred in the measure (scaled
 /// down uniformly if it is wider than the measure), then a numbered caption beneath. Building can fail --
 /// a malformed diagram -- in which case the placeholder holds the space so pagination is unchanged.
@@ -1935,7 +1997,13 @@ fn front_matter(
 		}
 	}
 
-	res!(fm_title_page(nodes, fonts, geom, style, fm));
+	// A documentation tree draws the template's two-column title page (a coloured sidebar with its logos and
+	// the title on the right); a book draws its plain centred title page. The sidebar grey marks the idiom.
+	if fm.sidebar_grey.is_some() {
+		res!(fm_doc_title_page(nodes, fonts, geom, fm));
+	} else {
+		res!(fm_title_page(nodes, fonts, geom, style, fm));
+	}
 	nodes.push(Node::Penalty(Penalty::eject()));
 
 	if fm_has_imprint(fm) {
@@ -2135,6 +2203,172 @@ fn fm_logo_node(_fonts: &Arc<FontSet>, geom: PageGeometry, _style: Style, path: 
 	}
 	row.push(Node::Leaf(Leaf::graphic(graphic)));
 	Ok(Node::HBox(BoxNode::new(row, Dims::new(measure, hh, Sp::ZERO))))
+}
+
+/// Sets the documentation template's two-column title page (`template.typ`'s `title-page`): a full-height
+/// coloured sidebar down the left carrying a logo near its top and one near its foot, and the title (large,
+/// in small caps or italic) with its subtitle centred on the white right. The whole page is one box whose
+/// graphic ops bleed past the box bounds to the paper edges -- the emitter clips nothing -- exactly as
+/// `doc_banner` draws its full-bleed bar. Its box origin is the content top-left (y down), so the page
+/// origin is `(-inside, -top)` and the paper corner `(page_w - inside, page_h - top)`.
+fn fm_doc_title_page(
+	nodes:	&mut Vec<Node>,
+	fonts:	&Arc<FontSet>,
+	geom:	PageGeometry,
+	fm:		&FrontMatter,
+)
+	-> Outcome<()>
+{
+	let measure	= geom.content_width();
+	let box_h	= geom.content_height();
+	let il		= geom.content_left().to_pt() as f32;	// left margin, and the sidebar logos' `margins.a4` pad
+	let it		= geom.content_top().to_pt() as f32;	// top margin, equal to the template's `margins.a4`
+	let pw		= geom.width.to_pt() as f32;
+	let ph		= geom.height.to_pt() as f32;
+	let frac	= fm.sidebar_frac as f32;
+	let side_w	= frac * pw;	// the sidebar width, `margins.title_page` of the page
+
+	let mut ops:	Vec<DrawOp> = Vec::new();
+
+	// The sidebar: a solid rectangle from the page's top-left corner, `side_w` wide and the full page tall.
+	let grey	= fm.sidebar_grey.unwrap_or(240);
+	let fill	= Rgba::opaque(grey, grey, grey);
+	ops.push(DrawOp::Fill {
+		path:	res!(Path::rect(Bounds::new(-il, -it, -il + side_w, -it + ph))),
+		colour:	fill,
+	});
+
+	// The top logo, centred across the sidebar, its top edge one `margins.a4` down from the page top -- which
+	// equals the top margin, so its box-frame top is zero. The bottom logo sits one `margins.a4` up from the
+	// page foot. Both are drawn at the width the `doc.with` call declared; a logo that will not load is left
+	// out, as the template's own missing-image path would leave a gap.
+	let side_mid_box	= -il + side_w / 2.0;	// the sidebar's horizontal centre, in the box frame
+	if let Some(path) = &fm.top_logo {
+		let w = fm.top_logo_width.to_pt() as f32;
+		if let Ok((logo, _)) = logo_ops(fonts, path, w, side_mid_box - w / 2.0, 0.0) {
+			ops.extend(logo);
+		}
+	}
+	if let Some(path) = &fm.bottom_logo {
+		let w = fm.bottom_logo_width.to_pt() as f32;
+		if let Ok((logo, lh)) = logo_ops(fonts, path, w, 0.0, 0.0) {
+			// Re-place now the height is known: bottom edge one `margins.a4` up from the page foot.
+			let dy = (ph - it) - it - lh;
+			let placed = res!(translate_ops(logo, side_mid_box - w / 2.0, dy));
+			ops.extend(placed);
+		}
+	}
+
+	// The title and subtitle centred on the right column: from the sidebar's right edge plus the template's
+	// 20 pt, running to the page's right margin less 20 pt. The title rides the column's vertical centre
+	// (the template's 40%/10%/50% grid seats it at the half), the subtitle two lines below.
+	let col_l		= side_w + 20.0;
+	let col_w		= pw - side_w - 40.0;
+	let centre_box	= -il + col_l + col_w / 2.0;
+	let title_size	= 40.0f32;	// the template's fixed title size, independent of the config type scale
+	let sub_size	= 20.0f32;
+	let title_top	= ph / 2.0 - it;	// the column centre, in the box frame
+	let sample		= res!(head_shape(fonts, &HeadFace::Role(Role::Body), Sp::from_pt(title_size as f64), "Ag"));
+	let asc			= sample.dims().height.to_pt() as f32;
+	let dep			= sample.dims().depth.to_pt() as f32;
+	let title_base	= title_top + asc;
+	res!(title_run_ops(&mut ops, fonts, &fm.title, title_size, centre_box, title_base, fm.title_smallcaps));
+	if let Some(sub) = &fm.subtitle {
+		// Two blank lines below the title (the template's `\ \`), then the subtitle in italic.
+		let sub_base = title_base + dep + 28.0 + sub_size;
+		res!(title_run_ops(&mut ops, fonts, sub, sub_size, centre_box, sub_base, false));
+	}
+
+	let graphic = Graphic::new(ops, Dims::new(measure, box_h, Sp::ZERO));
+	nodes.push(Node::HBox(BoxNode::new(
+		vec![Node::Leaf(Leaf::graphic(graphic))], Dims::new(measure, box_h, Sp::ZERO))));
+	Ok(())
+}
+
+/// Loads a logo (an SVG drawn as its own scaled paths, or a raster) at the drawn width `w`, translates its
+/// ops to `(dx, dy)` in the caller's frame, and returns them with the drawn height. The picture comes out
+/// sized to `w` with its aspect kept, so the height stands for where a bottom-aligned logo's top sits.
+fn logo_ops(
+	fonts:	&Arc<FontSet>,
+	path:	&str,
+	w:		f32,
+	dx:		f32,
+	dy:		f32,
+)
+	-> Outcome<(Vec<DrawOp>, f32)>
+{
+	let width	= Some(Length::Abs(w as f64));
+	let graphic	= match crate::image::load_figure(path) {
+		Ok(crate::image::Figure::Raster(img))	=> res!(image_graphic(Sp::from_pt(w as f64), img, width, None, None)),
+		Ok(crate::image::Figure::Vector(pic))	=> res!(svg_graphic(fonts.clone(), Sp::from_pt(w as f64), pic, width, None, None)),
+		Err(e)									=> return Err(e),
+	};
+	let h	= (graphic.dims.height + graphic.dims.depth).to_pt() as f32;
+	let ops	= res!(translate_ops(graphic.ops, dx, dy));
+	Ok((ops, h))
+}
+
+/// Translates every op of a graphic by `(dx, dy)` -- the fill and stroke paths through a translation, an
+/// embedded raster by shifting its placement corner. Used to seat a logo built at the origin where it belongs.
+fn translate_ops(src: Vec<DrawOp>, dx: f32, dy: f32) -> Outcome<Vec<DrawOp>> {
+	let t = Transform::translate(dx, dy);
+	let mut out: Vec<DrawOp> = Vec::with_capacity(src.len());
+	for op in src {
+		out.push(match op {
+			DrawOp::Fill { path, colour }			=> DrawOp::Fill { path: res!(path.transform(&t)), colour },
+			DrawOp::Stroke { path, colour, width }	=> DrawOp::Stroke { path: res!(path.transform(&t)), colour, width },
+			DrawOp::Image { image, x, y, w, h }		=> DrawOp::Image { image, x: x + dx, y: y + dy, w, h },
+		});
+	}
+	Ok(out)
+}
+
+/// Bakes a title or subtitle run to filled glyph outlines centred on `centre_x` at baseline `base_y`, in
+/// the box frame (y down). Small caps are synthesised run by run as the banner sets them (was-lowercase
+/// letters uppercased at 0.75 of the size); a plain run sets italic, matching the template's `emph`. The
+/// advance is measured first so the run seats on its centre, then each glyph's y-up outline is flipped
+/// onto the y-down baseline.
+fn title_run_ops(
+	ops:		&mut Vec<DrawOp>,
+	fonts:		&Arc<FontSet>,
+	text:		&str,
+	size_pt:	f32,
+	centre_x:	f32,
+	base_y:		f32,
+	smallcaps:	bool,
+)
+	-> Outcome<()>
+{
+	let size		= Sp::from_pt(size_pt as f64);
+	let small_size	= Sp(size.raw() * 3 / 4);
+	// Small caps sets upright (the template's `smallcaps`); a plain title sets italic (its `emph`).
+	let face		= if smallcaps { HeadFace::Role(Role::Body) } else { HeadFace::Role(Role::Italic) };
+	let runs		= if smallcaps { smallcaps_runs(text) } else { vec![(text.to_string(), false)] };
+
+	// Total advance, so the run seats centred on `centre_x`.
+	let mut total = 0.0f32;
+	for (run, is_small) in &runs {
+		let rs		= if *is_small { small_size } else { size };
+		let shaped	= res!(head_shape(fonts, &face, rs, run));
+		total += shaped.dims().width.to_pt() as f32;
+	}
+
+	let mut x = centre_x - total / 2.0;
+	for (run, is_small) in &runs {
+		let rs		= if *is_small { small_size } else { size };
+		let shaped	= res!(head_shape(fonts, &face, rs, run));
+		for glyph in &shaped.run().glyphs {
+			let outline = res!(shaped.outline(glyph));
+			if outline.is_empty() {
+				continue;	// a space carries an advance but no ink
+			}
+			let t = Transform::scale(1.0, -1.0)
+				.then(&Transform::translate(x + glyph.x, base_y - glyph.y));
+			ops.push(DrawOp::Fill { path: res!(outline.transform(&t)), colour: Rgba::BLACK });
+		}
+		x += shaped.dims().width.to_pt() as f32;
+	}
+	Ok(())
 }
 
 /// Sets the imprint (meta) page: the publisher, edition, copyright, rights, AI declaration, website and
@@ -3004,6 +3238,21 @@ fn rule_divider(nodes: &mut Vec<Node>, measure: Sp, width: Length, thickness: f6
 	nodes.push(Node::HBox(BoxNode::new(vec![Node::Leaf(Leaf::graphic(graphic))], Dims::new(measure, h, Sp::ZERO))));
 }
 
+/// Builds the footer logo graphic once: the image at `path` loaded (an SVG as its own scaled paths, a
+/// raster to fill its box) at the drawn height `h`, its ops seated at the origin so a page can place it
+/// at the foot. The height fixes the size and the width follows the aspect, matching the template's
+/// `image(footer-left-logo-path, height: 18pt)`.
+fn footer_logo_graphic(fonts: &Arc<FontSet>, path: &str, h: f64) -> Outcome<Graphic> {
+	let height = Some(Length::Abs(h));
+	// A wide box so the height hint, not the measure, governs the size; the picture keeps its aspect.
+	let box_w	= Sp::from_pt(1000.0);
+	match crate::image::load_figure(path) {
+		Ok(crate::image::Figure::Raster(img))	=> image_graphic(box_w, img, None, height, None),
+		Ok(crate::image::Figure::Vector(pic))	=> svg_graphic(fonts.clone(), box_w, pic, None, height, None),
+		Err(e)									=> Err(e),
+	}
+}
+
 /// Draws the page furniture -- a running head in the top margin and a folio -- onto every composed
 /// page. Called after the driver has converged: the furniture sits outside the text block, so adding
 /// it moves nothing and cannot reopen the fixed point.
@@ -3018,19 +3267,23 @@ fn rule_divider(nodes: &mut Vec<Node>, measure: Sp, width: Length, thickness: f6
 /// afterwards, so placing the folio at the block's left on a verso page lands it at the outer margin.
 /// Both the head and the folio are shaped through the same path as the body and drawn as glyph outlines.
 pub fn decorate(
-	pages:		&mut [Page],
-	ledger:		&Ledger,
-	heads:		&[Heading],
-	fonts:		&Arc<FontSet>,
-	style:		Style,
-	geom:		PageGeometry,
-	book_title:	&str,
+	pages:			&mut [Page],
+	ledger:			&Ledger,
+	heads:			&[Heading],
+	fonts:			&Arc<FontSet>,
+	style:			Style,
+	geom:			PageGeometry,
+	book_title:		&str,
+	footer_logo:	Option<&str>,
 )
 	-> Outcome<()>
 {
 	let content_top		= geom.content_top();
 	let content_left	= geom.content_left();
 	let content_width	= geom.content_width();
+	// The documentation template seats a logo at the left of every page footer. It is loaded once and
+	// placed on each body page; a logo that will not load leaves the footer to the folio alone.
+	let footer = footer_logo.and_then(|p| footer_logo_graphic(fonts, p, 18.0).ok().map(Arc::new));
 	// The body opens on this physical page; the printed folio restarts at one here, so a body page's
 	// folio is its physical page less the front matter before it. A run with no headings (a lone
 	// manuscript) leaves `body_start_page` zero, so the whole document is body and the folio is physical.
@@ -3042,6 +3295,12 @@ pub fn decorate(
 			continue;
 		}
 		let folio = page.number - (body_start - 1);
+
+		// The footer logo, seated at the left of the foot on every body page, its top at the folio's foot line.
+		if let Some(g) = &footer {
+			let foot_top = content_top + geom.content_height() + Sp::from_pt(14.0);
+			page.frame.push(Placed::new(content_left, foot_top, g.dims, PlacedKind::Graphic(g.clone())));
+		}
 
 		// The back matter -- the bibliography and beyond -- drops the running head and centres the folio at
 		// the foot, as the template sets it.

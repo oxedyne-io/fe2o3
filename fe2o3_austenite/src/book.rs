@@ -169,7 +169,7 @@ fn load_doc(root_dir: &Path, root_src: &str) -> Outcome<BookSpec> {
 	let heading:	Option<Arc<Font>>	= None;
 	let (blocks, skips)	= res!(assemble(root_src, root_dir));
 	let title		= content_field(root_src, "title").unwrap_or_default();
-	let front		= read_doc_front_matter(root_src, &raw, &title);
+	let front		= read_doc_front_matter(root_dir, root_src, &raw, &title);
 
 	// A doc tree names its bibliography, glossary and index through raw Typst calls the reader skips, not
 	// the book's `meta-data.bibliography` field, so no reference back matter is assembled here.
@@ -226,13 +226,33 @@ fn read_doc_config(root_dir: &Path, root_src: &str) -> Outcome<(PageGeometry, Ra
 	Ok((geom, raw))
 }
 
-/// The front matter a doc root states: its title and subtitle, and the author from the first `meta-data`
-/// entry. A doc tree carries no imprint (no ISBN, publisher or copyright tuple), so only a title page and
-/// the contents are composed from this; the display sizes take the doc scale rather than a book's.
-fn read_doc_front_matter(root_src: &str, raw: &RawStyle, title: &str) -> FrontMatter {
+/// The front matter a doc root states: its title and subtitle, the author from the first `meta-data`
+/// entry, and the documentation template's two-column title-page furniture -- the sidebar width and
+/// colour, the two sidebar logos with their declared widths, the small-caps flag, and the footer logo --
+/// read from the `#show: doc.with(...)` call and the shared `template.typ`. A doc tree carries no imprint
+/// (no ISBN, publisher or copyright tuple), so only a title page and the contents are composed from this.
+fn read_doc_front_matter(root_dir: &Path, root_src: &str, raw: &RawStyle, title: &str) -> FrontMatter {
 	let subtitle	= content_field(root_src, "subtitle");
 	let meta		= meta_block(root_src).unwrap_or_default();
 	let author		= string_field(&meta, "authors").unwrap_or_default();
+
+	// The sidebar width is `margins.title_page` in the shared template (a percentage of the page); the fill
+	// is the `title-colour` the call names, resolved to a grey level. A doc tree always draws the sidebar,
+	// so `sidebar_grey` is set here (marking the two-column idiom) even when the call omits its colour.
+	let template	= std::fs::read_to_string(root_dir.join("template.typ")).unwrap_or_default();
+	let sidebar_frac	= let_dict_field(&template, "margins", "title_page")
+		.and_then(|v| parse_percent(&v))
+		.unwrap_or(0.45);
+	let colour_name	= string_field(root_src, "title-colour").unwrap_or_default();
+	let sidebar_grey	= Some(grey_luma(&colour_name));
+
+	let non_empty	= |s: Option<String>| s.filter(|p| !p.is_empty());
+	let top_logo	= non_empty(string_field(root_src, "title-top-logo-path"));
+	let bottom_logo	= non_empty(string_field(root_src, "title-bottom-logo-path"));
+	let footer_logo	= non_empty(string_field(root_src, "footer-left-logo-path"));
+	let top_w		= first_len_after(root_src, "title-top-logo-width:").unwrap_or(80.0);
+	let bottom_w	= first_len_after(root_src, "title-bottom-logo-width:").unwrap_or(120.0);
+	let smallcaps	= bool_field(root_src, "title-smallcaps");
 
 	FrontMatter {
 		title:			title.to_string(),
@@ -254,7 +274,31 @@ fn read_doc_front_matter(root_src: &str, raw: &RawStyle, title: &str) -> FrontMa
 		subtitle_size:	Sp::from_pt(16.0),
 		author_size:	Sp::from_pt(17.0),
 		back_title_size:	Sp::from_pt(raw.h1_pt),
+		sidebar_grey,
+		sidebar_frac,
+		title_smallcaps:	smallcaps,
+		top_logo,
+		top_logo_width:		Sp::from_pt(top_w),
+		bottom_logo,
+		bottom_logo_width:	Sp::from_pt(bottom_w),
+		footer_logo,
 	}
+}
+
+/// Resolves a `template.typ` colour name to a grey level. Only the greys the doc trees reach for are
+/// mapped by name; every other name falls to the template's `colours.light` (luma 240), a light sidebar.
+fn grey_luma(name: &str) -> u8 {
+	match name {
+		"white"			=> 255,
+		"lightgrey"		=> 240,
+		"light"			=> 240,
+		_				=> 240,
+	}
+}
+
+/// Reads a Typst percentage literal (`45%`) as a fraction (`0.45`). `None` when no number leads it.
+fn parse_percent(s: &str) -> Option<f64> {
+	first_num(s).map(|n| n / 100.0)
 }
 
 // ┌───────────────────────────────────────────────────────────────────────────┐
@@ -532,6 +576,16 @@ fn read_front_matter(root_src: &str, config_src: &str, title: &str) -> FrontMatt
 		subtitle_size:	sz("subtitle:", 16.0),
 		author_size:	sz("author:", 17.0),
 		back_title_size:	sz("back-matter-title:", 17.0),
+		// A book draws its own plain centred title page, not the doc template's two-column one, so the
+		// documentation sidebar and logos are left unset (`sidebar_grey: None` keeps the plain title page).
+		sidebar_grey:		None,
+		sidebar_frac:		0.0,
+		title_smallcaps:	false,
+		top_logo:			None,
+		top_logo_width:		Sp::ZERO,
+		bottom_logo:		None,
+		bottom_logo_width:	Sp::ZERO,
+		footer_logo:		None,
 	}
 }
 
@@ -1245,11 +1299,49 @@ mod tests {
 			chap_num_pt: 54.0, chap_grid: [72.0, 8.0, 36.0, 20.0],
 			h1_pt: 14.0, h2_pt: 12.0, h3_pt: 13.0, h4_pt: 12.0,
 		};
-		let fm = read_doc_front_matter(root, &raw, "Austenite");
+		let fm = read_doc_front_matter(std::path::Path::new("/nonexistent"), root, &raw, "Austenite");
 		assert_eq!(fm.title, "Austenite");
 		assert_eq!(fm.subtitle.as_deref(), Some("Design Document"));
 		assert_eq!(fm.author, "J. D. Hoogland");
 		assert!(fm.isbn.is_none() && fm.copyright.is_none(), "a doc tree carries no imprint");
+		// A doc tree always draws the template's two-column title page, so the sidebar is marked even when
+		// the miniature root names no colour; the fraction falls to the template default with no template file.
+		assert!(fm.sidebar_grey.is_some(), "a doc title page draws the sidebar");
+		assert!((fm.sidebar_frac - 0.45).abs() < 1e-9, "the sidebar default fraction is 0.45");
+	}
+
+	#[test]
+	fn test_doc_front_matter_reads_title_page_logos_08() {
+		let root = r#"
+#show: doc.with(
+  title: [Austenite],
+  subtitle: [Design Document],
+  title-colour: "lightgrey",
+  title-smallcaps: true,
+  title-top-logo-path: "assets/svg/austenite_logo_text_right.svg",
+  title-top-logo-width: 150pt,
+  title-bottom-logo-path: "assets/svg/oxedyne_logo_dark_text_below_opt.svg",
+  title-bottom-logo-width: 120pt,
+  footer-left-logo-path: "assets/svg/fe2o3_logo_text_right.svg",
+  meta-data: (
+    ( version: "0.1.0", authors: "J. D. Hoogland", notes: "Initial." ),
+  ),
+)
+= Purpose
+"#;
+		let raw = RawStyle {
+			body_pt: 11.0, leading_em: 0.65, par_skip_em: 0.65, indent_em: 0.0,
+			chap_num_pt: 54.0, chap_grid: [72.0, 8.0, 36.0, 20.0],
+			h1_pt: 14.0, h2_pt: 12.0, h3_pt: 13.0, h4_pt: 12.0,
+		};
+		let fm = read_doc_front_matter(std::path::Path::new("/nonexistent"), root, &raw, "Austenite");
+		assert_eq!(fm.sidebar_grey, Some(240), "lightgrey resolves to luma 240");
+		assert!(fm.title_smallcaps, "the title sets in small caps");
+		assert_eq!(fm.top_logo.as_deref(), Some("assets/svg/austenite_logo_text_right.svg"));
+		assert_eq!(fm.bottom_logo.as_deref(), Some("assets/svg/oxedyne_logo_dark_text_below_opt.svg"));
+		assert_eq!(fm.footer_logo.as_deref(), Some("assets/svg/fe2o3_logo_text_right.svg"));
+		assert!((fm.top_logo_width.to_pt() - 150.0).abs() < 1e-6, "top logo width 150 pt");
+		assert!((fm.bottom_logo_width.to_pt() - 120.0).abs() < 1e-6, "bottom logo width 120 pt");
 	}
 
 	#[test]
