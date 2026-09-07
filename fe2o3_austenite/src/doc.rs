@@ -602,12 +602,15 @@ pub fn author(
 
 				// A chapter (level 1) or a part divider (level 0) opens a fresh page and stands alone; a
 				// deeper heading binds to the first line of the paragraph it introduces, so the greedy page
-				// breaker never strands it at a page foot. A doc tree whose sections carry their own
-				// `#section-banner` (the `DocInline` style) is the exception: its level-1 heading is set
-				// inline beneath the banner the section drew, so it takes the sub-heading path with no page
-				// break of its own -- the banner already turned the page.
+				// breaker never strands it at a page foot. A level-1 heading that carries its own
+				// `#section-banner` is the exception: it is set inline beneath the banner the section drew, so
+				// it takes the sub-heading path with no page break of its own -- the banner already turned the
+				// page. This holds whether the tree sets every section that way (`DocInline`, the Hematite
+				// guide) or opts one chapter in with an explicit `#section-banner` while defaulting to the
+				// grey title bar (`DocBanner`): an explicit banner always owns its chapter's header, so the
+				// duplicate title bar is suppressed regardless of the doc's default mode.
 				let opens = *level == 0
-					|| (*level == 1 && style.heading_style != HeadingStyle::DocInline);
+					|| (*level == 1 && style.heading_style != HeadingStyle::DocInline && !banner);
 				if opens {
 					if !first {
 						nodes.push(Node::Penalty(Penalty::eject()));
@@ -3826,5 +3829,33 @@ mod tests {
 		};
 		assert!(notes.contains("Created.") && notes.contains("Reading time: 51 [min]"),
 			"the notes cell appends the reading time: {:?}", notes);
+	}
+
+	#[test]
+	fn docbanner_section_banner_sets_its_heading_inline_not_a_second_opener() -> Outcome<()> {
+		// A `DocBanner` tree -- its default chapter opener is the grey title bar -- that opts one chapter in
+		// with an explicit `#section-banner` must set that chapter's title inline beneath the banner, not
+		// open a second grey bar of its own. The section banner forces one page eject; the heading that
+		// follows it must add none. Before the fix the heading opened as a chapter and the forced-eject
+		// count was two, which is the duplicate bar this guards against.
+		let fonts	= Arc::new(res!(crate::fonts::libertinus()));
+		let geom	= PageGeometry::a4();
+		let mut style	= Style::default();
+		style.heading_style = HeadingStyle::DocBanner;
+		let blocks = vec![
+			Block::Paragraph { text: "Intro before the section.".to_string() },
+			Block::section_banner("assets/svg/pearlite_logo_text_right.svg".to_string()),
+			Block::Heading { level: 1, segments: vec![Segment::text("Pearlite")], label: None },
+			Block::Paragraph { text: "Pearlite is the format.".to_string() },
+		];
+		let (doc, heads) = res!(author(fonts, geom, style, None, &blocks, None, None));
+		assert!(heads.iter().any(|h| h.level == 1 && h.title == "Pearlite" && h.banner),
+			"the level-1 heading after a #section-banner carries the banner flag");
+		let forced = doc.nodes.iter()
+			.filter(|n| matches!(n, Node::Penalty(p) if p.is_forced()))
+			.count();
+		assert_eq!(forced, 1,
+			"only the section banner forces a page break; its heading opens inline, adding none (got {})", forced);
+		Ok(())
 	}
 }
