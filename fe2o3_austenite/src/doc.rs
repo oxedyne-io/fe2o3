@@ -2479,7 +2479,7 @@ fn fm_meta_page(
 	if let Some(a) = &fm.ai_declaration	{ lines.push(a.clone()); }
 	if let Some(w) = &fm.website		{ lines.push(w.clone()); }
 	if fm.toolchain {
-		lines.push("Created using Typst (built using Rust) and Inkscape.".to_string());
+		lines.push("Created using Austenite (built using Rust) and Inkscape.".to_string());
 	}
 
 	let mut first = true;
@@ -2548,7 +2548,7 @@ fn fm_doc_meta_page(
 		foot.push(Node::Glue(Glue::fixed(gap)));
 		foot_h += gap;
 		let size	= Sp(style.body_size.raw() * 3 / 4);
-		let line	= "This document was created using Typst (built using Rust).";
+		let line	= "This document was created using Austenite (built using Rust).";
 		let broken	= res!(break_paragraph(fonts.clone(), Role::Body, Dir::Ltr, size, line, measure, Sp(size.raw() * 6 / 5)));
 		for n in &broken { foot_h += node_vext(n); }
 		foot.extend(broken);
