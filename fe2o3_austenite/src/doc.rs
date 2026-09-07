@@ -203,6 +203,9 @@ pub enum Block {
 	// A line-leading `#padded-image(...)`/`#image(...)`: the loaded image centred in the measure with a
 	// little space either side, carrying no figure number or caption -- a section opener's logo, not a float.
 	Image { path: String, width: Option<Length>, height: Option<Length>, scale: Option<f64> },
+	// A line-leading `#section-banner("logo")`: a fresh page, then the template's full-width grey bar hanging
+	// into the top and side margins, carrying the section's logo right-aligned on the band's vertical middle.
+	SectionBanner { path: String },
 }
 
 impl Block {
@@ -321,18 +324,28 @@ impl Block {
 	pub fn image(path: String, width: Option<Length>, height: Option<Length>, scale: Option<f64>) -> Self {
 		Self::Image { path, width, height, scale }
 	}
+
+	/// A documentation section's opening banner: a fresh page carrying the template's full-width grey bar
+	/// with the logo at `path` right-aligned on it.
+	pub fn section_banner(path: String) -> Self {
+		Self::SectionBanner { path }
+	}
 }
 
 /// The point sizes and vertical spaces the block layer sets to. Every length is scaled points, so
-/// How a top-level heading opens. A book chapter opens with the giant grey number and dotted
-/// numbering the manuscripts use ([`BookOpener`](HeadingStyle::BookOpener)); a documentation tree opens
-/// with the template's full-width grey banner bar and no numbering at all
-/// ([`DocBanner`](HeadingStyle::DocBanner)). The block layer reads this to pick the opener and to decide
-/// whether a heading carries a number, so one authoring path serves both idioms.
+/// How a top-level heading opens. A book chapter opens with the giant grey number and dotted numbering
+/// the manuscripts use ([`BookOpener`](HeadingStyle::BookOpener)); a documentation tree that opens each
+/// chapter with the template's full-width grey banner bar and no numbering takes
+/// ([`DocBanner`](HeadingStyle::DocBanner)); a documentation tree whose sections carry their own
+/// `#section-banner` logo bar (the Hematite guide) sets its level-1 headings inline instead, with no
+/// banner and no numbering ([`DocInline`](HeadingStyle::DocInline)) -- the template's `chapter-banners:
+/// false`. The block layer reads this to pick the opener and to decide whether a heading carries a
+/// number, so one authoring path serves every idiom.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadingStyle {
 	BookOpener,
 	DocBanner,
+	DocInline,
 }
 
 /// the styling never leaves the integer domain the driver breaks on.
@@ -437,6 +450,7 @@ pub struct Heading {
 	pub title:		String,	// the display words, markup removed, for the anchor slug and a plain fallback
 	pub segments:	Vec<Segment>,	// the title's rich runs, so a running head or contents entry renders its maths and emphasis
 	pub number:		String,	// the dotted number a numbered heading shows ("2.3.1"); empty for a part divider
+	pub banner:		bool,	// set inline beneath a `#section-banner`, so the page suppresses its running head like a chapter opener
 }
 
 /// The book's front matter, read from the root's template call: the title, subtitle and author the
@@ -509,6 +523,10 @@ pub fn author(
 	// first-line indent; one opening a section (after a heading, list, figure or the document start) does
 	// not -- Typst's `first-line-indent` with `all: false`, and what the oracle sets.
 	let mut prev_para	= false;
+	// Set when a `#section-banner` was the block just emitted, so the level-1 heading that follows it is
+	// marked as opening beneath a banner. It is consumed (and cleared) by that heading, the block the
+	// source always places immediately after the banner.
+	let mut pending_banner	= false;
 	let mut part_no	= 0u32;	// the part-divider ordinal, a document-order fold, shown as a Roman numeral
 	let mut foot_no	= 0u32;	// the footnote number, a document-order fold over the marks
 	let mut ref_no	= 0u32;	// a running counter giving each inline cross-reference its own anchor id
@@ -536,8 +554,8 @@ pub fn author(
 				// A documentation tree sets `numbering: none`: its headings carry no dotted number, on the
 				// heading line, in the contents, or before a sub-heading. A book keeps the document-order number.
 				let number = match style.heading_style {
-					HeadingStyle::DocBanner	=> String::new(),
-					HeadingStyle::BookOpener	=> heading_number(*level, &sec),
+					HeadingStyle::DocBanner | HeadingStyle::DocInline	=> String::new(),
+					HeadingStyle::BookOpener							=> heading_number(*level, &sec),
 				};
 
 				// The rendered title, its markup reduced to display words: it keys the anchor slug and is the
@@ -545,18 +563,28 @@ pub fn author(
 				// rich runs below, so a glossary term or emphasis in a heading renders rather than leaking.
 				let title = flatten_segments(segments);
 				let id = AnchorId::new(AnchorKind::Heading, fmt!("{:02}-{}", heads.len() + 1, slug(&title)));
+				// A level-1 heading that follows a `#section-banner` opens its section beneath the banner, so
+				// its page suppresses the running head like a chapter opener; the flag is one-shot.
+				let banner = pending_banner && *level == 1;
+				pending_banner = false;
 				heads.push(Heading {
 					id:			id.clone(),
 					level:		*level,
 					title:		title.clone(),
 					segments:	segments.clone(),
 					number:		number.clone(),
+					banner,
 				});
 
 				// A chapter (level 1) or a part divider (level 0) opens a fresh page and stands alone; a
 				// deeper heading binds to the first line of the paragraph it introduces, so the greedy page
-				// breaker never strands it at a page foot.
-				if *level <= 1 {
+				// breaker never strands it at a page foot. A doc tree whose sections carry their own
+				// `#section-banner` (the `DocInline` style) is the exception: its level-1 heading is set
+				// inline beneath the banner the section drew, so it takes the sub-heading path with no page
+				// break of its own -- the banner already turned the page.
+				let opens = *level == 0
+					|| (*level == 1 && style.heading_style != HeadingStyle::DocInline);
+				if opens {
 					if !first {
 						nodes.push(Node::Penalty(Penalty::eject()));
 					}
@@ -754,6 +782,7 @@ pub fn author(
 				title:		title.clone(),
 				segments:	vec![Segment::text(title.clone())],
 				number:		String::new(),
+				banner:		false,
 			});
 				nodes.push(Node::Anchor(id));
 				// The title left in the display face at the chapter-title size (the template's
@@ -791,6 +820,16 @@ pub fn author(
 			},
 			Block::Image { path, width, height, scale } => {
 				res!(plain_image(&mut nodes, fonts.clone(), measure, path, *width, *height, *scale));
+				i += 1;
+				first = false;
+				prev_para = false;
+			},
+			Block::SectionBanner { path } => {
+				// The template's `#section-banner` turns the page first (`pagebreak(weak: true)`); a forced
+				// eject the driver drops when the page is already fresh, so it never opens a blank one.
+				nodes.push(Node::Penalty(Penalty::eject()));
+				res!(section_banner(&mut nodes, fonts.clone(), geom, measure, path));
+				pending_banner = true;	// the section's level-1 heading follows and opens beneath this banner
 				i += 1;
 				first = false;
 				prev_para = false;
@@ -2853,14 +2892,14 @@ fn subheading_hbox(
 )
 	-> Outcome<Node>
 {
-	// A documentation tree sets its sub-headings from the template's show rule -- level 2 bold-italic,
-	// level 3 italic, deeper levels upright -- with no small caps; a book takes the display face (or body
-	// bold) and small-caps the finer levels.
-	let doc			= style.heading_style == HeadingStyle::DocBanner;
+	// A documentation tree sets its sub-headings from the template's show rule -- an inline level-1 heading
+	// (a `DocInline` tree) bold small-caps, level 2 bold-italic, level 3 italic, deeper levels upright; a
+	// book takes the display face (or body bold) and small-caps the finer levels.
+	let doc			= matches!(style.heading_style, HeadingStyle::DocBanner | HeadingStyle::DocInline);
 	let face		= if doc { doc_head_face(level) } else { head_face(level, display) };
 	let size		= style.heading_size(level);
 	let small_size	= Sp(size.raw() * 3 / 4);	// small caps at 0.75 of the heading size
-	let smallcaps	= !doc && level >= 3;
+	let smallcaps	= if doc { level == 1 } else { level >= 3 };
 	let sample		= res!(head_shape(&fonts, &face, size, "Ag"));
 	let asc			= sample.dims().height;
 	let dep			= sample.dims().depth;
@@ -2923,11 +2962,13 @@ fn subheading_hbox(
 	Ok(Node::HBox(BoxNode::new(children, Dims::new(width, asc, dep))))
 }
 
-/// The face a documentation sub-heading level sets in, matching `template.typ`'s heading show rule: level
-/// 2 bold-italic, level 3 italic, level 4 and deeper upright. All in the body family (Libertinus), which
-/// is the doc heading family too, so no display face is consulted.
+/// The face a documentation heading level sets in, matching `template.typ`'s heading show rule: an inline
+/// level-1 heading bold (and small-capped by its caller), level 2 bold-italic, level 3 italic, level 4 and
+/// deeper upright. All in the body family (Libertinus), which is the doc heading family too, so no display
+/// face is consulted.
 fn doc_head_face(level: u8) -> HeadFace<'static> {
 	match level {
+		1	=> HeadFace::Role(Role::Bold),
 		2	=> HeadFace::Role(Role::BoldItalic),
 		3	=> HeadFace::Role(Role::Italic),
 		_	=> HeadFace::Role(Role::Body),
@@ -3217,6 +3258,66 @@ fn doc_banner(
 	Ok(())
 }
 
+/// Draws the documentation template's section banner (`template.typ`'s `section-banner`): the same
+/// full-width grey bar `doc_banner` hangs into the page's top and side margins, but carrying the section's
+/// logo right-aligned on the band's vertical middle rather than a title -- the Hematite guide's per-section
+/// mark. The logo is loaded at the template's 30 pt height and its right edge seated one page margin
+/// (2.5 cm) in from the page's right edge (the template's `pad(right: 2.5cm)`), which lands on the content's
+/// right edge. The bar is drawn from one box whose ops bleed past its bounds -- the emitter clips nothing --
+/// and the box holds the template's `#v(95pt)` of following space, so the inline heading beneath lands where
+/// the oracle sets it. A logo that will not load leaves the bar alone.
+fn section_banner(
+	nodes:		&mut Vec<Node>,
+	fonts:		Arc<FontSet>,
+	geom:		PageGeometry,
+	measure:	Sp,
+	path:		&str,
+)
+	-> Outcome<()>
+{
+	let grey		= Rgba::opaque(240, 240, 240);	// the template's `colours.lightgrey`, luma(240)
+	let banner_h	= 150.0f32;						// the template's rect height
+	let follow		= Sp::from_pt(95.0);			// the template's `#v(95pt)` down to the heading
+	let logo_h		= 30.0f32;						// the template's `image(logo_path, height: 30pt)`
+	// The box origin is the content top-left, y down; the bar reaches the page's left edge (x = -inside) and
+	// top edge (y = -top), runs the full page width and 150 pt deep, so it hangs into both margins.
+	let inside_pt	= geom.content_left().to_pt() as f32;
+	let top_pt		= geom.content_top().to_pt() as f32;
+	let page_w_pt	= geom.width.to_pt() as f32;
+	let x0			= -inside_pt;
+	let y0			= -top_pt;
+	let x1			= page_w_pt - inside_pt;
+	let y1			= banner_h - top_pt;
+
+	let mut ops:	Vec<DrawOp>	= Vec::new();
+	ops.push(DrawOp::Fill { path: res!(Path::rect(Bounds::new(x0, y0, x1, y1))), colour: grey });
+
+	// The logo, loaded 30 pt tall, its right edge one page margin in from the page's right edge (the content
+	// right edge) and its box centred on the band's vertical middle. Its own ops are in a top-left frame,
+	// y down; a plain translation seats them. A logo that will not load draws the bar alone.
+	if let Ok(logo) = footer_logo_graphic(&fonts, path, logo_h as f64) {
+		let lw			= logo.dims.width.to_pt() as f32;
+		let lh			= (logo.dims.height + logo.dims.depth).to_pt() as f32;
+		let right		= x1 - inside_pt;			// 2.5 cm in from the page right edge = the content right edge
+		let band_mid	= (banner_h / 2.0) - top_pt;	// the band's vertical middle, box frame, y down
+		let tx			= right - lw;
+		let ty			= band_mid - lh / 2.0;
+		let t			= Transform::translate(tx, ty);
+		for op in logo.ops {
+			ops.push(match op {
+				DrawOp::Fill { path, colour }			=> DrawOp::Fill { path: res!(path.transform(&t)), colour },
+				DrawOp::Stroke { path, colour, width }	=> DrawOp::Stroke { path: res!(path.transform(&t)), colour, width },
+				DrawOp::Image { image, x, y, w, h }		=> DrawOp::Image { image, x: x + tx, y: y + ty, w, h },
+			});
+		}
+	}
+
+	let graphic = Graphic::new(ops, Dims::new(measure, follow, Sp::ZERO));
+	// The box holds the `#v(95pt)` of flow space; the bar draws past its top edge into the margins.
+	nodes.push(Node::HBox(BoxNode::new(vec![Node::Leaf(Leaf::graphic(graphic))], Dims::new(measure, follow, Sp::ZERO))));
+	Ok(())
+}
+
 /// A rigid vertical spacer: a zero-width box of the given height, so it holds its space at a page top
 /// where leading glue would be discarded.
 fn vspacer(height: Sp) -> Node {
@@ -3333,10 +3434,11 @@ pub fn decorate(
 				if a.pos.page < page.number {
 					if h.level == 1 { chapter = Some(h); }
 				} else if a.pos.page == page.number {
-					if a.pos.y == content_top {
-						if h.level == 1 { opens = true; }	// a chapter opens at the very top
-						if h.level == 0 { opens_part = true; }	// a part divider opens at the very top
-					}
+					// A chapter opens the page either at its very top (a numbered or banner-bar opener) or
+					// beneath a `#section-banner` this page carries: both suppress the running head and seat the
+					// folio at the foot, so the head never lands on the grey bar.
+					if h.level == 1 && (a.pos.y == content_top || h.banner) { opens = true; }
+					if h.level == 0 && a.pos.y == content_top { opens_part = true; }	// a part divider opens at the very top
 				} else {
 					break;	// headings are in document order, so the rest resolve to later pages
 				}

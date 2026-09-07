@@ -1388,6 +1388,7 @@ enum CaptureKind {
 	Figure,			// a `#figure(...)` call, possibly wrapping a table or an image
 	Table,			// a bare `#table(...)` call
 	Image,			// a line-leading `#padded-image(...)` or `#image(...)` set without a figure number
+	SectionBanner,	// a line-leading `#section-banner("logo")`, a full-width grey bar carrying a section logo
 	Let(String),	// a `#let name = (...)` data array bound to this name
 	Columns,		// a `#columns(n)[ ... ]` wrapper: its body is set single-column
 }
@@ -1404,6 +1405,12 @@ fn capture_opener(trimmed: &str) -> Option<CaptureKind> {
 	}
 	if trimmed.starts_with("#columns(") {
 		return Some(CaptureKind::Columns);
+	}
+	// A documentation section opens with a line-leading `#section-banner("logo")` -- a full-width grey bar
+	// carrying the section's logo -- captured here so the bar is drawn rather than the call dropped. Tried
+	// before `#image(`, since the name contains none of the others as a prefix.
+	if trimmed.starts_with("#section-banner(") {
+		return Some(CaptureKind::SectionBanner);
 	}
 	// A section opener draws its logo with a line-leading `#padded-image(...)` (the Pearl section's pearlite
 	// mark), and a bare `#image(...)` places a graphic likewise. Both are set centred without a figure
@@ -1465,6 +1472,12 @@ fn dispatch_capture(
 			let (path, width, height, scale) = image_call(&cap.buf);
 			if !path.is_empty() {
 				items.push(Item::Image { path, width, height, scale, span: Span::new(0, 0) });
+			}
+		},
+		CaptureKind::SectionBanner => {
+			// The first positional argument is the logo path; a call naming none draws nothing.
+			if let Some(path) = call_inner(&cap.buf, "section-banner").as_deref().and_then(first_string) {
+				items.push(Item::SectionBanner { path, span: Span::new(0, 0) });
 			}
 		},
 		CaptureKind::Columns => {
@@ -2157,6 +2170,25 @@ mod tests {
 		assert_eq!(img.1, Some(0.45), "the padded-image scale is read as a fraction");
 		// The line must not have been swallowed as a skipped construct, nor turned into a figure.
 		assert!(!items.iter().any(|it| matches!(it, Item::Figure { .. })), "a section logo is not a figure");
+		Ok(())
+	}
+
+	/// A line-leading `#section-banner("logo")` (a documentation section opener) is read as an
+	/// [`Item::SectionBanner`] carrying its logo path, not skipped as a template call and not confused with a
+	/// plain `#image`.
+	#[test]
+	fn line_leading_section_banner_reads_as_banner() -> Outcome<()> {
+		let (items, skips) = res!(document_with_skips(
+			"#section-banner(\"assets/svg/fe2o3_logo_text_right.svg\")\n\n= Steel Server\n\nSteel is the server.\n"));
+		let path = res!(items.iter().find_map(|it| match it {
+			Item::SectionBanner { path, .. }	=> Some(path.clone()),
+			_								=> None,
+		}).ok_or_else(|| err!("no Item::SectionBanner was produced for the standalone section-banner"; Test, Bug)));
+		assert_eq!(path, "assets/svg/fe2o3_logo_text_right.svg", "the banner logo path is read");
+		// The call must not have been swallowed as a skipped construct, nor read as a plain centred image.
+		assert!(!skips.entries().iter().any(|(name, _)| name == "#section-banner"),
+			"a section banner must not be reported as a skipped construct");
+		assert!(!items.iter().any(|it| matches!(it, Item::Image { .. })), "a section banner is not a plain image");
 		Ok(())
 	}
 

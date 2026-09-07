@@ -160,15 +160,23 @@ fn load_book(root_dir: &Path, root_src: &str) -> Outcome<BookSpec> {
 fn load_doc(root_dir: &Path, root_src: &str) -> Outcome<BookSpec> {
 	let (geom, raw)	= res!(read_doc_config(root_dir, root_src));
 	let mut style	= build_style(&raw);
-	// A doc tree sets `numbering: none` and opens each top-level heading with the template's grey banner
-	// bar, not the book's numbered chapter opener, so its headings take the doc banner style.
-	style.heading_style = HeadingStyle::DocBanner;
+	let title		= content_field(root_src, "title").unwrap_or_default();
+	// A doc tree sets `numbering: none`; its top-level headings open with the template's grey banner bar
+	// unless the tree draws its own per-section `#section-banner` logo bars, in which case each level-1
+	// heading is set inline beneath the section's banner. This mirrors the template's `chapter-banners`
+	// argument: an explicit `true`/`false` decides, and its `auto` default turns the chapter banners off
+	// only for the Hematite guide, whose sections carry logo banners instead.
+	let want_banners = tri_bool(root_src, "chapter-banners").unwrap_or(title != "Hematite");
+	style.heading_style = if want_banners {
+		HeadingStyle::DocBanner
+	} else {
+		HeadingStyle::DocInline
+	};
 	let fonts		= Arc::new(res!(fonts::libertinus()));
 	// A doc heading is set in Libertinus bold -- the body family -- so no display face is supplied, and
 	// the heading path falls back to the body bold, which is exactly what the template's show rule sets.
 	let heading:	Option<Arc<Font>>	= None;
 	let (blocks, skips)	= res!(assemble(root_src, root_dir));
-	let title		= content_field(root_src, "title").unwrap_or_default();
 	let front		= read_doc_front_matter(root_dir, root_src, &raw, &title);
 
 	// A doc tree names its bibliography, glossary and index through raw Typst calls the reader skips, not
@@ -761,6 +769,24 @@ fn bool_field(src: &str, name: &str) -> bool {
 			rest[..end].trim().starts_with("true")
 		},
 		None		=> false,
+	}
+}
+
+/// A three-way boolean argument in the root's template call: `Some(true)`/`Some(false)` when the field is
+/// set to `true`/`false`, and `None` when it is absent or left `auto`, so the caller can supply its own
+/// default for the `auto` case.
+fn tri_bool(src: &str, name: &str) -> Option<bool> {
+	let needle	= fmt!("{}:", name);
+	let at		= src.find(&needle)?;
+	let rest	= &src[at + needle.len()..];
+	let end		= rest.find(',').unwrap_or(rest.len());
+	let val		= rest[..end].trim();
+	if val.starts_with("true") {
+		Some(true)
+	} else if val.starts_with("false") {
+		Some(false)
+	} else {
+		None
 	}
 }
 
