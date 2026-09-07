@@ -77,7 +77,22 @@ impl Draw {
 	}
 }
 
-/// One page: its size in points, and the shapes drawn on it, back to front.
+/// A clickable link over a rectangle of the page: a `/Link` annotation whose action opens a URI. The
+/// rectangle is in the engine's page frame -- top-left origin, y down, in points -- exactly as a draw's
+/// coordinates are, so a caller hands over the same rectangle it placed the ink in and [`PdfStream`]
+/// flips it into PDF's y-up frame when it writes the annotation. The border is drawn away, so a linked
+/// image reads as the picture alone.
+#[derive(Clone, Debug)]
+pub struct LinkAnnot {
+	pub x0:		f64,	// left, engine frame (points)
+	pub y0:		f64,	// top
+	pub x1:		f64,	// right
+	pub y1:		f64,	// bottom
+	pub uri:	String,	// the destination the link opens
+}
+
+/// One page: its size in points, the shapes drawn on it back to front, and any clickable link
+/// annotations over it.
 ///
 /// The coordinates in the paths are the engine's page frame -- top-left origin, y increasing
 /// downwards -- exactly as the SVG writer receives them. [`PdfWriter`] applies the flip to PDF's
@@ -87,12 +102,20 @@ pub struct PdfPage {
 	pub width:	f64,	// media box width, in points
 	pub height:	f64,	// media box height, in points
 	pub draws:	Vec<Draw>,
+	pub annots:	Vec<LinkAnnot>,	// clickable link rectangles; a page with none writes no /Annots
 }
 
 impl PdfPage {
 
 	pub fn new(width: f64, height: f64) -> Self {
-		Self { width, height, draws: Vec::new() }
+		Self { width, height, draws: Vec::new(), annots: Vec::new() }
+	}
+
+	/// Adds a clickable link over the rectangle at top-left `(x, y)`, `w` wide and `h` tall in the
+	/// engine's y-down point frame -- the same frame [`image`](Self::image) places a raster in -- opening
+	/// `uri`. The page gains an `/Annots` entry; a page with no link stays byte-identical to before.
+	pub fn link(&mut self, x: f64, y: f64, w: f64, h: f64, uri: String) {
+		self.annots.push(LinkAnnot { x0: x, y0: y, x1: x + w, y1: y + h, uri });
 	}
 
 	pub fn fill(&mut self, path: Path, colour: Rgba) {
@@ -434,6 +457,16 @@ impl<W: Write> PdfStream<W> {
 			}
 		}
 
+		// The link annotations, if any, take one further object -- the `/Annots` array -- numbered after the
+		// images. A page with no link claims no number and writes no `/Annots`, so its bytes are unchanged.
+		let annots_obj = if page.annots.is_empty() {
+			None
+		} else {
+			let a = self.next_extra;
+			self.next_extra += 1;
+			Some(a)
+		};
+
 		// The content stream was serialised by the caller so its `/Length` is known before the object that
 		// wraps it; only the optional compression is left to do here.
 		let bytes = if self.compress {
@@ -443,10 +476,14 @@ impl<W: Write> PdfStream<W> {
 		};
 
 		self.offsets[page_obj] = self.pos;
+		let annots = match annots_obj {
+			Some(a)	=> fmt!(" /Annots {} 0 R", a),
+			None	=> String::new(),
+		};
 		let head = fmt!(
 			"{} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] {} \
-				/Contents {} 0 R >>\nendobj\n",
-			page_obj, numf(page.width), numf(page.height), resources(page, &img_objs), content_obj);
+				/Contents {} 0 R{} >>\nendobj\n",
+			page_obj, numf(page.width), numf(page.height), resources(page, &img_objs), content_obj, annots);
 		res!(self.body(head.as_bytes()));
 
 		self.offsets[content_obj] = self.pos;
@@ -471,7 +508,36 @@ impl<W: Write> PdfStream<W> {
 			}
 		}
 
+		// The `/Annots` array, on the number reserved above: one `/Link` annotation per link, each with its
+		// rectangle flipped into PDF's y-up frame and a URI action. Written after the images so the extra
+		// offsets are recorded in increasing number order.
+		if let Some(a) = annots_obj {
+			res!(self.write_annots(a, page));
+		}
+
 		self.added += 1;
+		Ok(())
+	}
+
+	/// Writes a page's `/Annots` array: one `/Link` annotation per [`LinkAnnot`], its rectangle flipped from
+	/// the engine's top-left, y-down frame into PDF's bottom-left, y-up one, its border drawn away, and its
+	/// action opening the URI. The dictionaries are inlined in the array object, so a page's links cost one
+	/// object however many they are. Only called when the page carries at least one link.
+	fn write_annots(&mut self, obj: usize, page: &PdfPage) -> Outcome<()> {
+		self.set_extra_offset(obj);
+		let mut s = fmt!("{} 0 obj\n[ ", obj);
+		for a in &page.annots {
+			// Flip y: a point at engine y lands at PDF `height - y`, so the top edge (smaller engine y)
+			// becomes the upper PDF coordinate and the bottom edge the lower one.
+			let lly = page.height - a.y1;
+			let ury = page.height - a.y0;
+			s.push_str(&fmt!(
+				"<< /Type /Annot /Subtype /Link /Border [0 0 0] /Rect [{} {} {} {}] \
+					/A << /S /URI /URI {} >> >> ",
+				numf(a.x0), numf(lly), numf(a.x1), numf(ury), pdf_text_string(&a.uri)));
+		}
+		s.push_str("]\nendobj\n");
+		res!(self.body(s.as_bytes()));
 		Ok(())
 	}
 
@@ -964,6 +1030,45 @@ mod tests {
 		assert_eq!(pdf_text_string("Contents"), "(Contents)");
 		// Parentheses and backslashes in a literal are escaped.
 		assert_eq!(pdf_text_string("a (b) \\ c"), "(a \\(b\\) \\\\ c)");
+		Ok(())
+	}
+
+	#[test]
+	fn test_a_link_annotation_is_emitted_over_a_rect_08() -> Outcome<()> {
+		// A page 100 wide by 200 tall with a link over the rectangle at top-left (10, 20), 30 wide, 40 tall.
+		// The page dict names an /Annots array, and the annotation is a /Link with a URI action whose /Rect
+		// is the rectangle flipped into PDF's y-up frame: [10, 200-60, 40, 200-20] = [10 140 40 180].
+		let mut w = PdfWriter::new();
+		let mut page = PdfPage::new(100.0, 200.0);
+		page.fill(res!(Path::rect(Bounds::new(10.0, 10.0, 90.0, 90.0))), Rgba::BLACK);
+		page.link(10.0, 20.0, 30.0, 40.0, "https://need2know.ai/with-ai/doc".to_string());
+		w.add_page(page);
+		let bytes = res!(w.to_bytes());
+		let text = String::from_utf8_lossy(&bytes);
+		assert!(text.contains("/Annots"), "the page dict names an annotation array, found: {}", text);
+		assert!(text.contains("/Subtype /Link"), "a link annotation is written");
+		assert!(text.contains("/S /URI /URI (https://need2know.ai/with-ai/doc)"), "the URI action, found: {}", text);
+		assert!(text.contains("/Rect [10 140 40 180]"), "the rectangle flipped into PDF space, found: {}", text);
+		assert!(text.contains("/Border [0 0 0]"), "the border is drawn away");
+		Ok(())
+	}
+
+	#[test]
+	fn test_no_link_leaves_the_page_bytes_identical_09() -> Outcome<()> {
+		// A page with no link writes no /Annots and no annotation object -- byte for byte as before the
+		// feature. The two builds of the same annot-free page also agree, so the field adds no nondeterminism.
+		let build = || -> Outcome<Vec<u8>> {
+			let mut w = PdfWriter::new();
+			let mut page = PdfPage::new(100.0, 100.0);
+			page.fill(res!(Path::rect(Bounds::new(1.0, 1.0, 9.0, 9.0))), Rgba::new(10, 20, 30, 255));
+			w.add_page(page);
+			w.to_bytes()
+		};
+		let bytes = res!(build());
+		let text = String::from_utf8_lossy(&bytes);
+		assert!(!text.contains("/Annots"), "no annotation array when the page carries no link");
+		assert!(!text.contains("/Subtype /Link"), "no link annotation is written");
+		assert_eq!(res!(build()), bytes, "an annot-free page is deterministic");
 		Ok(())
 	}
 

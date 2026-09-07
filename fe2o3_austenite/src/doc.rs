@@ -514,6 +514,7 @@ pub struct MetaRow {
 	pub notes:			Option<String>,
 	pub ai_mark_path:	Option<String>,	// the declaration mark image, resolved from the row's slug
 	pub ai_mark_words:	Option<String>,	// the mark's caption, the row's own words when it rescopes them
+	pub ai_mark_url:	Option<String>,	// the scheme page the mark links to, <scheme>/<slug>/<medium>
 }
 
 /// Turns an authored block list into the composed document, and the heading table the running heads
@@ -2614,6 +2615,7 @@ fn build_meta_table(fm: &FrontMatter) -> Outcome<Table> {
 					path:	path.clone(),
 					height:	Sp::from_pt(36.0),	// the template's `image(.., height: 36pt)`
 					words:	words.clone(),
+					url:	mr.ai_mark_url.clone(),
 				};
 				Cell::rich_with_mark(vec![Segment::text(mr.authors.clone())], Align::Left, mark)
 			},
@@ -3807,6 +3809,7 @@ mod tests {
 				notes:			Some("Created.".to_string()),
 				ai_mark_path:	Some("assets/svg/doc_made_with_ai_opt.svg".to_string()),
 				ai_mark_words:	Some("Made with AI".to_string()),
+				ai_mark_url:	Some("https://need2know.ai/with-ai/doc".to_string()),
 			}],
 			reading_min:	Some(51),
 			acknowledgement:	Some("We acknowledge...".to_string()),

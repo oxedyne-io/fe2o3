@@ -63,15 +63,17 @@ pub enum Align {
 	Right,
 }
 
-/// An image mark stacked beneath a cell's text: the meta page's "Made with AI" chip and its caption,
-/// linked in the Typst source and rendered here as the image and its words alone (the link is dropped,
-/// as the PDF writer emits no image link annotation). The mark occupies its own band under the cell's
-/// last text line, the image seated left with the caption beside it.
+/// An image mark stacked beneath a cell's text: the meta page's "Made with AI" chip and its caption. The
+/// chip is a clickable link to the declaration's scheme page (`url`); the PDF writer draws a link
+/// annotation over it, while the SVG writer sets it as a plain image. Only the image is the link, the
+/// caption beside it plain, matching the template. The mark occupies its own band under the cell's last
+/// text line, the image seated left with the caption beside it.
 #[derive(Clone, Debug)]
 pub struct CellMark {
-	pub path:	String,	// the mark image, resolved against the image base directory
-	pub height:	Sp,		// the drawn image height
-	pub words:	String,	// the caption set beside the image
+	pub path:	String,			// the mark image, resolved against the image base directory
+	pub height:	Sp,				// the drawn image height
+	pub words:	String,			// the caption set beside the image
+	pub url:	Option<String>,	// the declaration scheme page the chip links to
 }
 
 /// One cell: its inline content, and how that content aligns in the column. A cell carries a run of
@@ -334,7 +336,11 @@ fn mark_line(
 )
 	-> Outcome<CellLine>
 {
-	let graphic	= res!(crate::doc::image_at_height(&fonts, &mark.path, mark.height.to_pt()));
+	let mut graphic	= res!(crate::doc::image_at_height(&fonts, &mark.path, mark.height.to_pt()));
+	// The chip carries the declaration's scheme link; the PDF writer draws an annotation over its box.
+	if let Some(url) = &mark.url {
+		graphic = graphic.with_link(url.clone());
+	}
 	let img		= Leaf::graphic(graphic);
 	let img_w	= img.dims.width;
 	let img_h	= img.dims.height;

@@ -215,6 +215,7 @@ impl Plot {
 		Ok(Graphic {
 			ops,
 			dims: Dims::new(Sp::from_pt(self.width as f64), Sp::from_pt(self.height as f64), Sp::ZERO),
+			link: None,
 		})
 	}
 }
@@ -308,6 +309,7 @@ impl BarChart {
 		Ok(Graphic {
 			ops,
 			dims: Dims::new(Sp::from_pt(total_w as f64), Sp::from_pt(total_h as f64), Sp::ZERO),
+			link: None,
 		})
 	}
 }

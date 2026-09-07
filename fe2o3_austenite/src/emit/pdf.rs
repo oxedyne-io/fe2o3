@@ -160,6 +160,14 @@ fn draw_graphic(
 	let t = Transform::translate(bx.to_pt() as f32, by.to_pt() as f32);
 	let ox = bx.to_pt();
 	let oy = by.to_pt();
+	// A linked graphic (the meta page's "Made with AI" chip) draws a clickable link annotation over its
+	// placement box, in the same y-down engine frame the ink is placed in; the writer flips it into PDF
+	// space. Only the mark carries the link, matching the template, where the words beside it are plain.
+	if let Some(url) = &graphic.link {
+		let w = graphic.dims.width.to_pt();
+		let h = (graphic.dims.height + graphic.dims.depth).to_pt();
+		out.link(ox, oy, w, h, url.clone());
+	}
 	for op in &graphic.ops {
 		match op {
 			DrawOp::Fill { path, colour }			=> out.fill(res!(path.transform(&t)), *colour),
@@ -206,4 +214,66 @@ fn draw_text(
 		out.fill(placed, Rgba::BLACK);
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::ir::{
+		DrawOp,
+		Dims,
+		Graphic,
+		Sp,
+	};
+	use crate::page::{
+		Frame,
+		Page,
+		PageGeometry,
+		Placed,
+		PlacedKind,
+	};
+	use std::sync::Arc;
+
+	#[test]
+	fn a_linked_graphic_emits_a_link_annotation() -> Outcome<()> {
+		// A placed graphic carrying a link (the meta page's "Made with AI" chip) draws a PDF link annotation
+		// over its box; a graphic with no link draws none, so the SVG-style plain image is unchanged.
+		let geom	= PageGeometry::new(Sp::from_pt(200.0), Sp::from_pt(300.0), Sp::from_pt(20.0));
+		let rect	= res!(Path::rect(Bounds::new(0.0, 0.0, 36.0, 36.0)));
+		let graphic	= Graphic::new(
+			vec![DrawOp::Fill { path: rect, colour: Rgba::BLACK }],
+			Dims::new(Sp::from_pt(36.0), Sp::from_pt(36.0), Sp::ZERO))
+			.with_link("https://need2know.ai/with-ai/doc".to_string());
+		let mut frame = Frame::new();
+		frame.push(Placed::new(
+			Sp::from_pt(50.0), Sp::from_pt(80.0), graphic.dims,
+			PlacedKind::Graphic(Arc::new(graphic))));
+		let page	= Page::new(1, geom, frame);
+		let bytes	= res!(render_document(&[page]));
+		let text	= String::from_utf8_lossy(&bytes);
+		assert!(text.contains("/Subtype /Link"), "a link annotation is emitted, found: {}", text);
+		assert!(text.contains("/S /URI /URI (https://need2know.ai/with-ai/doc)"), "the URI action is written");
+		// The box top-left (50, 80), 36 by 36, flips on a 300pt page to [50, 300-116, 86, 300-80] = [50 184 86 220].
+		assert!(text.contains("/Rect [50 184 86 220]"), "the rectangle flips into PDF space, found: {}", text);
+		Ok(())
+	}
+
+	#[test]
+	fn an_unlinked_graphic_emits_no_annotation() -> Outcome<()> {
+		let geom	= PageGeometry::new(Sp::from_pt(200.0), Sp::from_pt(300.0), Sp::from_pt(20.0));
+		let rect	= res!(Path::rect(Bounds::new(0.0, 0.0, 36.0, 36.0)));
+		let graphic	= Graphic::new(
+			vec![DrawOp::Fill { path: rect, colour: Rgba::BLACK }],
+			Dims::new(Sp::from_pt(36.0), Sp::from_pt(36.0), Sp::ZERO));
+		let mut frame = Frame::new();
+		frame.push(Placed::new(
+			Sp::from_pt(50.0), Sp::from_pt(80.0), graphic.dims,
+			PlacedKind::Graphic(Arc::new(graphic))));
+		let page	= Page::new(1, geom, frame);
+		let bytes	= res!(render_document(&[page]));
+		let text	= String::from_utf8_lossy(&bytes);
+		assert!(!text.contains("/Annots"), "no annotation array without a link");
+		assert!(!text.contains("/Subtype /Link"), "no link annotation without a link");
+		Ok(())
+	}
 }

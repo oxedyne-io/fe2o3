@@ -240,11 +240,20 @@ pub enum DrawOp {
 pub struct Graphic {
 	pub ops:	Vec<DrawOp>,
 	pub dims:	Dims,
+	pub link:	Option<String>,	// a URL the whole graphic links to, drawn as a PDF link annotation over its box
 }
 
 impl Graphic {
 	pub fn new(ops: Vec<DrawOp>, dims: Dims) -> Self {
-		Self { ops, dims }
+		Self { ops, dims, link: None }
+	}
+
+	/// Makes the whole graphic a clickable link to `url` -- the PDF writer draws a link annotation over its
+	/// placement box. The meta page's "Made with AI" chip carries the scheme URL this way; the SVG writer,
+	/// which sets the mark as a plain image, leaves it unlinked.
+	pub fn with_link(mut self, url: String) -> Self {
+		self.link = Some(url);
+		self
 	}
 }
 

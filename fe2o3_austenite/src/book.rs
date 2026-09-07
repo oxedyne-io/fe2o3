@@ -275,19 +275,28 @@ fn read_doc_front_matter(root_dir: &Path, root_src: &str, raw: &RawStyle, title:
 	let meta		= meta_block(root_src).unwrap_or_default();
 	let author		= string_field(&meta, "authors").unwrap_or_default();
 
+	// The AI scheme address the mark links to, `<scheme>/<slug>/<medium>`, read from the shared template's
+	// `ai-scheme-url` and `ai-medium` lets (the template's `link(ai-scheme-url + "/" + slug + "/" +
+	// ai-medium, ..)`). A tree without the template falls back to the scheme's permanent home and doc medium.
+	let template		= std::fs::read_to_string(root_dir.join("template.typ")).unwrap_or_default();
+	let ai_scheme_url	= first_quoted_after(&template, "ai-scheme-url").unwrap_or_else(|| "https://need2know.ai".to_string());
+	let ai_medium		= first_quoted_after(&template, "ai-medium").unwrap_or_else(|| "doc".to_string());
+
 	// The revision rows the template's meta/colophon page draws: each row's version, date, notes, and the
-	// AI declaration whose slug picks the mark image and its caption (a `declaration-words` field rescopes
-	// the caption without changing the mark). A doc tree may state several rows, newest first.
+	// AI declaration whose slug picks the mark image, its caption (a `declaration-words` field rescopes the
+	// caption without changing the mark) and the scheme page the mark links to. A doc tree may state several
+	// rows, newest first.
 	let meta_rows: Vec<crate::doc::MetaRow> = meta_rows(&meta).iter().map(|row| {
-		let (ai_mark_path, ai_mark_words) = match string_field(row, "declaration") {
+		let (ai_mark_path, ai_mark_words, ai_mark_url) = match string_field(row, "declaration") {
 			Some(slug)	=> match ai_declaration_mark(&slug) {
 				Some((path, words))	=> {
 					let words = string_field(row, "declaration-words").unwrap_or(words);
-					(Some(path), Some(words))
+					let url = fmt!("{}/{}/{}", ai_scheme_url, slug, ai_medium);
+					(Some(path), Some(words), Some(url))
 				},
-				None				=> (None, None),
+				None				=> (None, None, None),
 			},
-			None		=> (None, None),
+			None		=> (None, None, None),
 		};
 		crate::doc::MetaRow {
 			version:	string_field(row, "version"),
@@ -296,6 +305,7 @@ fn read_doc_front_matter(root_dir: &Path, root_src: &str, raw: &RawStyle, title:
 			notes:		string_field(row, "notes"),
 			ai_mark_path,
 			ai_mark_words,
+			ai_mark_url,
 		}
 	}).collect();
 	// The colophon furniture the template fixes for the doc idiom: the acknowledgement paragraph, and the
